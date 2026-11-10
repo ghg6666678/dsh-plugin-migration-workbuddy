@@ -8,8 +8,11 @@ export interface MigrationApi {
   deleteMemory(id: string): Promise<boolean>
 }
 
+/** Marker required by the host for mutating routes; keep in sync with src/routes.ts. */
+const CLIENT_HEADER = 'x-workbuddy-migration'
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { ...init, headers: { accept: 'application/json', ...(init?.body ? { 'content-type': 'application/json' } : {}) } })
+  const response = await fetch(path, { ...init, headers: { accept: 'application/json', [CLIENT_HEADER]: '1', ...(init?.body ? { 'content-type': 'application/json' } : {}) } })
   const raw = await response.text()
   let value: ({ error?: string } & T) | undefined
   try { value = raw.length > 0 ? JSON.parse(raw) as { error?: string } & T : undefined } catch { /* preserve plain-text server errors below */ }

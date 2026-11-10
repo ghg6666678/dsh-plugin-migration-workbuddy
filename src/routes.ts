@@ -11,16 +11,53 @@ export const MIGRATION_ARCHIVE_PATH = '/api/migration/workbuddy/archive'
 export const MIGRATION_MEMORY_UPDATE_PATH = '/api/migration/workbuddy/memory/update'
 export const MIGRATION_MEMORY_DELETE_PATH = '/api/migration/workbuddy/memory/delete'
 
+/** Sent by the bundled client on every call; keep in sync with src/client/api.ts. */
+export const MIGRATION_CLIENT_HEADER = 'x-workbuddy-migration'
+
 function loopback(req: IncomingMessage): boolean {
   const address = req.socket.remoteAddress
   return address === '127.0.0.1' || address === '::1' || address?.startsWith('::ffff:127.') === true
 }
 
-function sameOrigin(req: IncomingMessage, mutating: boolean, port: number): boolean {
-  if (!loopback(req) || req.headers.host !== `127.0.0.1:${String(port)}`) return false
-  const expected = `http://127.0.0.1:${String(port)}`
-  if (mutating) return req.headers.origin === expected
-  return req.headers.origin === undefined || req.headers.origin === expected
+function loopbackHosts(port: number): Set<string> {
+  return new Set([
+    `127.0.0.1:${String(port)}`,
+    `localhost:${String(port)}`,
+    `[::1]:${String(port)}`,
+  ])
+}
+
+/**
+ * Guard against DNS rebinding and cross-site writes while remaining usable from
+ * the Electron desktop shell: its document can carry `Origin: null` (or no
+ * Origin at all), and the host spellings vary between loopback aliases. The real
+ * barriers are a loopback peer plus an exact loopback Host. For writes we also
+ * require the bundled client's marker header: a cross-site page cannot set a
+ * custom header without a CORS preflight, which these routes never grant.
+ */
+export function sameOrigin(req: IncomingMessage, mutating: boolean, port: number): boolean {
+  if (!loopback(req)) return false
+  const host = req.headers.host
+  const hosts = loopbackHosts(port)
+  if (host === undefined || !hosts.has(host)) return false
+  const origin = req.headers.origin
+  // Reject a genuine cross-site http(s) origin. Opaque origins ("null",
+  // custom desktop schemes, or a missing header) are expected from the
+  // Electron shell; the marker header below is what stops forged writes.
+  const externalHttpOrigin = origin !== undefined
+    && origin !== 'null'
+    && /^https?:\/\//i.test(origin)
+    && ![...hosts].some(value => `http://${value}` === origin || `https://${value}` === origin)
+  if (externalHttpOrigin) return false
+  if (mutating) {
+    // The bundled client always sends the marker. Sec-Fetch-Site is a fallback
+    // for shells that proxy the request and drop custom headers; browsers set
+    // it themselves, so a cross-site form cannot forge "same-origin"/"none".
+    return req.headers[MIGRATION_CLIENT_HEADER] === '1'
+      || req.headers['sec-fetch-site'] === 'same-origin'
+      || req.headers['sec-fetch-site'] === 'none'
+  }
+  return true
 }
 
 function sendJson(res: ServerResponse, statusCode: number, value: unknown): void {
