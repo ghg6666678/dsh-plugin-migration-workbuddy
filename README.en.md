@@ -6,6 +6,28 @@ The plugin works out of the box and exposes a settings flow: **scan → preview 
 → import → auditable manifest**. Opening the page performs only a local **read-only** scan; it never
 copies, moves, or modifies WorkBuddy data.
 
+## Compatibility
+
+This branch targets DSH **0.2.x** (verified against `0.2.2-rc.1`). The minimum is declared in
+`package.json` as `engines.dsh` (`>=0.1.2-rc.1 <0.3.0`) so DSH can validate the plugin at load time
+without a per-version exemption.
+
+Compared with v0.1.0, v0.1.1 fixes four incompatibilities with the current client:
+
+- Converted messages are normalized for **session format v4** (assistant message sources, the
+  `kind` of context snapshots); otherwise every append is rejected.
+- Imported sessions are written through the **0.2 persistence handle** (`create()` returns a write
+  handle and the seed prefix is declared via `inheritedEventCount`); the removed
+  `sessionPersistence.append()` is no longer called.
+- Write routes accept requests from the **Electron desktop shell** (`Origin: null` or absent):
+  loopback peer + exact loopback Host + a bundled-client marker header, which a cross-site page
+  cannot forge.
+- The settings UI uses DSH **design tokens**, so it no longer renders as a bright white card in
+  dark mode.
+
+It also recognizes newer WorkBuddy session events (`session-meta`, `resend-fork-notice`,
+`credit-usage`) and fixes checkbox/select-all interaction on the session and automation cards.
+
 ## Install
 
 The package ships a `cordis.patch.yml` and declares itself a profile bundle through
@@ -16,7 +38,7 @@ hand-written composition row needed.
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/dingguangyi0/dsh-plugin-migration-workbuddy/releases/download/v0.1.0/dsh-plugin-migration-workbuddy-0.1.0.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.1.1/dsh-plugin-migration-workbuddy-0.1.1.tgz
 ```
 
 The tarball already contains a built `lib/`: measured at **one command, ~3 seconds, exit 0**, with no
@@ -25,7 +47,7 @@ The tarball already contains a built `lib/`: measured at **one command, ~3 secon
 ### From GitHub by tag (needs a build permission)
 
 ```bash
-dsh plugin --profile <name> add github:dingguangyi0/dsh-plugin-migration-workbuddy#v0.1.0
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.1.1
 ```
 
 A git install fetches **sources, not built artifacts**, so this package ships a `prepare` script that
@@ -36,7 +58,7 @@ exact key into the profile's `pnpm-workspace.yaml` and re-run the same `add`:
 ```yaml
 # $DSH_HOME/profiles/<name>/pnpm-workspace.yaml
 allowBuilds:
-  dsh-plugin-migration-workbuddy@https://codeload.github.com/dingguangyi0/dsh-plugin-migration-workbuddy/tar.gz/<commit-sha>: true
+  dsh-plugin-migration-workbuddy@https://codeload.github.com/ghg6666678/dsh-plugin-migration-workbuddy/tar.gz/<commit-sha>: true
 ```
 
 Two things we measured, both easy to get wrong:
@@ -58,8 +80,8 @@ dsh plugin --profile <name> add /absolute/path/to/dsh-plugin-migration-workbuddy
 ### Packing your own tarball / publishing to a registry
 
 ```bash
-pnpm pack     # produces dsh-plugin-migration-workbuddy-0.1.0.tgz (runs prepare, so it includes lib/)
-dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.1.0.tgz
+pnpm pack     # produces dsh-plugin-migration-workbuddy-0.1.1.tgz (runs prepare, so it includes lib/)
+dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.1.1.tgz
 
 # once published to a registry (flip package.json private to false and pick a license first)
 dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
@@ -140,7 +162,9 @@ failing the batch. Sessions, memories, and MCP are unaffected.
 
 ## Security boundaries
 
-- Every scan is read-only, and routes accept **loopback same-origin** requests only.
+- Every scan is read-only, and routes require a **loopback peer with an exact loopback Host**; writes
+  additionally require the bundled client's marker header. The Electron desktop shell has no normal
+  http Origin, and a cross-site page cannot forge either condition.
 - Preview paths pass through `sanitizePathForPreview`, and credential-shaped fields are dropped
   during parsing.
 - Attachments, branches, original system prompts, and full legacy SQLite restoration are not

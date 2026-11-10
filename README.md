@@ -5,6 +5,24 @@
 插件开箱可用，在设置页提供 **扫描 → 预览 → 明确确认 → 导入 → 审计清单** 的完整闭环；
 打开页面只做本机**只读**扫描，不会复制、移动或修改任何 WorkBuddy 数据。
 
+## 兼容性
+
+本分支适配 DSH **0.2.x**（实测 `0.2.2-rc.1`），最低版本写在 `package.json` 的 `engines.dsh`
+（`>=0.1.2-rc.1 <0.3.0`），由 DSH 加载时校验，不需要逐版本豁免。
+
+相对 v0.1.0，v0.1.1 修掉了在当前客户端上的四处不兼容：
+
+- 会话消息按 **session format v4** 归一化（assistant 消息的 source、context 快照的 `kind`），
+  否则每次 append 都被拒；
+- 通过 **0.2 的 persistence 写入句柄**落盘（`create()` 返回 handle，seed 前缀用
+  `inheritedEventCount` 声明），不再调用已移除的 `sessionPersistence.append()`；
+- 写路由接受 **Electron 桌面壳**的请求（`Origin: null` 或无 Origin）：loopback peer +
+  精确 loopback Host + 打包客户端的标记头，跨站页面依旧无法伪造；
+- 设置页改用 DSH **设计令牌**，深色主题下不再是一块亮白卡片。
+
+另外补上了新版 WorkBuddy 会话事件的识别（`session-meta`、`resend-fork-notice`、`credit-usage`），
+并修了会话/自动化卡片勾选与「全选」的交互。
+
 ## 安装
 
 本包自带 `cordis.patch.yml`，并通过 `dsh.bundle.patch` 声明自己是 profile bundle：`dsh plugin add`
@@ -14,7 +32,7 @@
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/dingguangyi0/dsh-plugin-migration-workbuddy/releases/download/v0.1.0/dsh-plugin-migration-workbuddy-0.1.0.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.1.1/dsh-plugin-migration-workbuddy-0.1.1.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -23,7 +41,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:dingguangyi0/dsh-plugin-migration-workbuddy#v0.1.0
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.1.1
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从
@@ -34,7 +52,7 @@ git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare
 ```yaml
 # $DSH_HOME/profiles/<name>/pnpm-workspace.yaml
 allowBuilds:
-  dsh-plugin-migration-workbuddy@https://codeload.github.com/dingguangyi0/dsh-plugin-migration-workbuddy/tar.gz/<commit-sha>: true
+  dsh-plugin-migration-workbuddy@https://codeload.github.com/ghg6666678/dsh-plugin-migration-workbuddy/tar.gz/<commit-sha>: true
 ```
 
 实测两点坑：
@@ -56,8 +74,8 @@ dsh plugin --profile <name> add /绝对路径/dsh-plugin-migration-workbuddy
 ### 自己打 tarball / 发布到 registry
 
 ```bash
-pnpm pack     # 产出 dsh-plugin-migration-workbuddy-0.1.0.tgz（会自动跑 prepare，含 lib/）
-dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.1.0.tgz
+pnpm pack     # 产出 dsh-plugin-migration-workbuddy-0.1.1.tgz（会自动跑 prepare，含 lib/）
+dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.1.1.tgz
 
 # 发布到 registry 之后（需先把 package.json 的 private 改为 false 并定许可证）
 dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
@@ -124,7 +142,8 @@ dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
 
 ## 安全边界
 
-- 所有扫描只读；路由只接受 **loopback + 同源** 请求。
+- 所有扫描只读；路由只接受 **loopback peer + 精确 loopback Host** 的请求，写操作还要求打包客户端的
+  标记头 —— Electron 桌面壳没有正常的 http Origin，跨站页面也无法伪造这两个条件。
 - 预览返回的路径经过 `sanitizePathForPreview` 脱敏，凭据类字段在解析阶段就被剔除。
 - 附件、分支、原始 system prompt、旧版 SQLite 完整恢复尚未支持。DSH 没有通用物理删除接口，
   因此撤销语义是**归档 + 清单审计**。
