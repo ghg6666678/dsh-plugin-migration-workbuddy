@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { basename, isAbsolute, relative, sep } from 'node:path'
 import { createAssistantMessage, createToolResultMessage, createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
-import { SessionId, SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { SESSION_FORMAT_VERSION, SessionId, SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ConvertedSession, LossRecord } from './model.js'
 import type { WorkBuddySessionMetadata } from './workbuddy-db.js'
@@ -90,6 +90,50 @@ function surfaceEvent<T extends 'user/message' | 'assistant/message' | 'tool/res
   time: number,
 ): SessionEvent<T> {
   return { ...event(type, data, seq, time), surfaceOp: 'append' } as SessionEvent<T>
+}
+
+/**
+ * dsh session format v4 (0.2.x) refuses any durable message whose source is
+ * missing a producer-owned `kind`, or still uses the retired 'plugin' wrapper.
+ * Older converters emitted `{ provider, model }` for assistant messages and
+ * `{ kind: 'plugin', ... }` for context snapshots. Unknown kinds are admitted
+ * verbatim, so a migration-specific kind keeps both generations readable.
+ */
+const IMPORT_SOURCE_KIND = 'workbuddy-migration'
+/** V4 refuses the retired 'plugin' wrapper; V3 still uses it for snapshots. */
+const V4 = Number(SESSION_FORMAT_VERSION) >= 4
+
+function producerSource(value: unknown): Record<string, unknown> {
+  const source = value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  const kind = source.kind
+  const owned = typeof kind === 'string' && kind.length > 0 && (!V4 || kind !== 'plugin')
+  return { ...source, kind: owned ? kind : IMPORT_SOURCE_KIND }
+}
+
+/**
+ * Replace (never mutate) each message with a copy carrying an admissible
+ * source. dsh-llm's message factories return frozen objects, so assigning
+ * `message.source` in place throws even though the surrounding event is plain.
+ */
+export function normalizeMessageSources(events: SessionEvent[]): SessionEvent[] {
+  for (let index = 0; index < events.length; index += 1) {
+    const item = events[index]!
+    const data = item.data as unknown
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) continue
+    const record = data as Record<string, unknown>
+    if (item.type === 'user/message') {
+      events[index] = { ...item, data: { ...record, source: producerSource(record.source) } } as SessionEvent
+    } else if (item.type === 'assistant/message' || item.type === 'tool/result') {
+      const message = record.message
+      if (message !== null && typeof message === 'object' && !Array.isArray(message)) {
+        const copy = message as Record<string, unknown>
+        events[index] = { ...item, data: { ...record, message: { ...copy, source: producerSource(copy.source) } } } as SessionEvent
+      }
+    }
+  }
+  return events
 }
 
 function pushTurn(events: SessionEvent[], turn: number, time: number, append: (seq: number, step: number) => SessionEvent[], seq: number): number {
@@ -281,6 +325,7 @@ export async function convertWorkBuddySession(path: string, root: string, metada
     for (const item of events) item.seq = SessionSeq(Number(item.seq) + 1)
     events.unshift({ type: 'session/title', seq: SessionSeq(0), time: Number.isFinite(createdAt) ? createdAt : Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } } as unknown as SessionEvent)
   }
+  normalizeMessageSources(events)
   const id = `workbuddy-${sourceHash.slice(0, 24)}`
   return {
     sourcePath: path,

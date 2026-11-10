@@ -28,6 +28,15 @@ describe('writeSeededSession', () => {
     expect(append).toHaveBeenCalledWith(id, events)
   })
 
+  it('releases the write handle even when append is rejected', async () => {
+    const close = vi.fn(async () => undefined)
+    const append = vi.fn(async () => { throw new Error('format v4 rejected the batch') })
+    const create = vi.fn(async () => ({ append, close }))
+    await expect(writeSeededSession({ create } as unknown as SessionPersistence, header, events, id))
+      .rejects.toThrow('format v4 rejected the batch')
+    expect(close).toHaveBeenCalled()
+  })
+
   it('fails with a clear message when neither API shape is available', async () => {
     const create = vi.fn(async () => undefined)
     await expect(writeSeededSession({ create } as unknown as SessionPersistence, header, events, id))

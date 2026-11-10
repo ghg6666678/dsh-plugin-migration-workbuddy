@@ -57,9 +57,15 @@ export async function writeSeededSession(
   if (handle === undefined || handle === null || typeof handle.append !== 'function') {
     throw new Error('unsupported sessionPersistence API: create() returned no write handle and append() is unavailable')
   }
-  await handle.append(events)
-  await handle.flush?.()
-  await handle.close?.()
+  try {
+    await handle.append(events)
+    await handle.flush?.()
+  } finally {
+    // A failed append (e.g. a format rejection) must still release the write
+    // lease. Otherwise the created id stays pending in the process and every
+    // later attempt fails with "session already exists".
+    await handle.close?.()
+  }
 }
 
 interface Manifest {
