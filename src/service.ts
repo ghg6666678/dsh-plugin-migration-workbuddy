@@ -18,8 +18,48 @@ import { readWorkBuddyCatalog, readWorkBuddySessionMetadata, type WorkBuddySessi
 import { replaceFile } from './atomic-file.js'
 
 interface WorkspaceLike {
-  resolveByPath(path: string): Promise<{ id: string; attachSession(id: string): Promise<void> } | undefined>
-  create(path: string, title?: string): Promise<{ id: string; attachSession(id: string): Promise<void> }>
+  resolveByPath(path: string): Promise<{ id: string; attachSession?(id: string): Promise<void> } | undefined>
+  create(path: string, title?: string): Promise<{ id: string; attachSession?(id: string): Promise<void> }>
+}
+
+/** dsh >= 0.2 returns an owned write handle from sessionPersistence.create(). */
+interface SessionWriteHandle {
+  append(events: SessionEvent[]): Promise<unknown>
+  flush?(): Promise<unknown> | unknown
+  close?(): Promise<unknown> | unknown
+}
+
+/**
+ * Persist a seeded session across both persistence generations.
+ *
+ * dsh 0.1.x exposes persistence.append(id, events) and takes the seed offset as
+ * create()'s second argument. dsh 0.2.x removed that method: create() returns
+ * an owned write handle, events go through handle.append(), and the seed prefix
+ * is declared with options.inheritedEventCount. Closing the handle completes
+ * durability and releases write ownership, which the sidebar needs to list it.
+ */
+export async function writeSeededSession(
+  persistence: SessionPersistence,
+  header: SessionHeader,
+  events: SessionEvent[],
+  id: SessionId,
+): Promise<void> {
+  const api = persistence as unknown as {
+    create(header: SessionHeader, options?: unknown): Promise<unknown>
+    append?(id: SessionId, events: SessionEvent[]): Promise<unknown>
+  }
+  if (typeof api.append === 'function') {
+    await api.create(header, SessionLogOffset(events.length))
+    await api.append(id, events)
+    return
+  }
+  const handle = await api.create(header, { inheritedEventCount: events.length }) as SessionWriteHandle | undefined
+  if (handle === undefined || handle === null || typeof handle.append !== 'function') {
+    throw new Error('unsupported sessionPersistence API: create() returned no write handle and append() is unavailable')
+  }
+  await handle.append(events)
+  await handle.flush?.()
+  await handle.close?.()
 }
 
 interface Manifest {
@@ -436,8 +476,7 @@ export class MigrationService {
           // runtime then treats [0, events.length) as seed and never replays the
           // imported log into the live surface, which would otherwise duplicate
           // the whole history in the first request (gateway: Duplicate tool output).
-          await this.persistence.create(header, SessionLogOffset(converted.events.length))
-          await this.persistence.append(SessionId(targetId), converted.events as SessionEvent[])
+          await writeSeededSession(this.persistence, header, converted.events as SessionEvent[], SessionId(targetId))
           // WorkBuddy records carry the authoritative workspace in `cwd`. The
           // sanitized project directory is only a fallback: splitting its
           // hyphens cannot faithfully represent nested paths.
@@ -446,7 +485,10 @@ export class MigrationService {
             try {
               const title = metadata?.mode === 'session' ? '会话模式' : basename(workspacePath)
               const workspace = await this.workspaceRegistry.resolveByPath(workspacePath) ?? await this.workspaceRegistry.create(workspacePath, title)
-              await workspace.attachSession(targetId)
+              // dsh >= 0.2 rebuilds workspace membership from stored session
+              // headers (cwd) at startup and has no attachSession method. Older
+              // builds need the explicit attach; call it only when present.
+              if (typeof workspace.attachSession === 'function') await workspace.attachSession(targetId)
             } catch (cause) {
               // A missing/unavailable source workspace must not make an otherwise
               // valid session import fail. It remains visible under Ungrouped and
