@@ -26,6 +26,12 @@ const KNOWN_EVENTS = new Set([
   'ai-title',
   'custom-title',
   'summary',
+  // Bookkeeping records emitted by newer WorkBuddy desktop builds. The
+  // converter has nothing to import from them, but they are expected input
+  // and must not flood the audit with "unknown event" warnings.
+  'session-meta',
+  'resend-fork-notice',
+  'credit-usage',
 ])
 
 export function defaultWorkBuddyRoot(env: NodeJS.ProcessEnv = process.env): string {
