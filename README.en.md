@@ -38,7 +38,7 @@ DSH → WorkBuddy export direction (see the export section below).
 
 **v0.4.4** fixes "the export board says there is nothing to export although the session clearly has new turns": the DSH 0.2.x session backends no longer expose `inspect()`, and `list()` now returns snapshots that nest the header. The export side therefore failed to read any events and every session id stringified to `"undefined"`, so all sessions rendered as empty. Reads now probe capabilities (`inspect` → `open/read` → `load`) and accept either `list()` shape.
 
-**v0.4.5** adds the three boards the export direction was missing (memories / MCP / scheduled tasks), so the export side mirrors import one for one, and fixes the "select sessions precisely" dialog whose left workspace column was so wide the right pane was squeezed out of sight.
+**v0.4.5** adds the three boards the export direction was missing (memories / MCP / scheduled tasks), so the export side mirrors import one for one, and fixes the "select sessions precisely" dialog whose left workspace column was so wide the right pane was squeezed out of sight (the split now adapts to the panel's own width via a container query).
 
 ## Install
 
