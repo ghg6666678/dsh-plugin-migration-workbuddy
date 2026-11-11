@@ -136,6 +136,24 @@ export function normalizeMessageSources(events: SessionEvent[]): SessionEvent[] 
   return events
 }
 
+/**
+ * dsh 0.2 stores the attempt's timed stream on the settlement event, and the
+ * current format rejects an `assistant/message` without the `stream` member.
+ * The published event type still describes the pre-0.2 shape, so add the empty
+ * stream explicitly: imported history has no live chunks to embed.
+ */
+export function normalizeAssistantSettlements(events: SessionEvent[]): SessionEvent[] {
+  for (let index = 0; index < events.length; index += 1) {
+    const item = events[index]!
+    if (item.type !== 'assistant/message') continue
+    const record = item.data as unknown
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) continue
+    const data = record as Record<string, unknown>
+    if (!Array.isArray(data.stream)) events[index] = { ...item, data: { ...data, stream: [] } } as SessionEvent
+  }
+  return events
+}
+
 function pushTurn(events: SessionEvent[], turn: number, time: number, append: (seq: number, step: number) => SessionEvent[], seq: number): number {
   events.push(event('turn/start', { turn }, seq++, time))
   // DSH turn/step numbers are one-based. A zero turn is accepted by TypeScript
@@ -326,6 +344,7 @@ export async function convertWorkBuddySession(path: string, root: string, metada
     events.unshift({ type: 'session/title', seq: SessionSeq(0), time: Number.isFinite(createdAt) ? createdAt : Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } } as unknown as SessionEvent)
   }
   normalizeMessageSources(events)
+  normalizeAssistantSettlements(events)
   const id = `workbuddy-${sourceHash.slice(0, 24)}`
   return {
     sourcePath: path,

@@ -1,5 +1,21 @@
 # 更新日志
 
+## v0.1.3 — 2026-11-11
+
+修复补上 `session/end-seed` 之后暴露的第二层不兼容：
+
+```
+seed assistant/message at index N has invalid settlement fields
+```
+
+当前格式要求 `assistant/message` 的 data 带 `message` 和数组 `stream`（0.2 起把 attempt 的定时流
+内嵌进结算事件）。转换器此前只写 `{turn, step, message}`；现在统一补 `stream: []`——导入的历史
+没有可内嵌的实时 chunk，空数组是忠实表示。`normalizeMessageSources` 之后新增
+`normalizeAssistantSettlements` 统一处理。
+
+> 用 v0.1.1 / v0.1.2 导入过的会话不会自动变好：需要就地补 `stream: []`，或删除会话与清单条目后
+> 重导。
+
 ## v0.1.2 — 2026-11-11
 
 修复导入后的会话打不开：`stored session ... is corrupt: released v2 seeded Session lacks an

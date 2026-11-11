@@ -175,4 +175,22 @@ describe('WorkBuddy converter', () => {
     expect(results.map(block => (block.type === 'tool-result' ? block.toolCallId : ''))).toEqual(['orphan', 'twice'])
     expect(converted.loss.map(item => item.code)).toEqual(expect.arrayContaining(['duplicate-tool-result', 'duplicate-tool-call']))
   })
+
+  it('settles assistant messages with an explicit stream member for current persistence', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-converter-settlement-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'hi', timestamp: 1000 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'hello', timestamp: 1100 }),
+    ].join('\n'))
+
+    const converted = await convertWorkBuddySession(path, root)
+    const assistant = (converted.events as Array<{ type?: string; data?: { stream?: unknown } }>)
+      .filter(event => event.type === 'assistant/message')
+    expect(assistant.length).toBeGreaterThan(0)
+    for (const item of assistant) {
+      expect(Array.isArray(item.data?.stream)).toBe(true)
+    }
+  })
 })
