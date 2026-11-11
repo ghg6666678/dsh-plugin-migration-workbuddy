@@ -73,6 +73,9 @@ function exportResultStub(exported: number) {
     sessions: [],
     errors: [],
     pendingImport: [],
+    memories: { written: 0, skipped: 0, targetPath: '' },
+    mcp: { written: 0, skipped: 0, targetPath: '', secretKeys: [] },
+    automations: { written: 0, skipped: 0, unsupported: 0 },
   }
 }
 
@@ -94,6 +97,45 @@ function previewStub() {
       workbuddySessionId: 'pending:abc',
       transcriptPath: 'C:\\Users\\ASUS\\.workbuddy\\projects\\p\\abc.jsonl',
     }],
+    memories: {
+      targetPath: 'C:\\Users\\ASUS\\.workbuddy\\MEMORY.md',
+      targetExists: true,
+      records: [{
+        id: 'm1',
+        content: '把导出目录固定在 D 盘',
+        source: 'record' as const,
+        sourcePath: 'C:\\Users\\ASUS\\.dsh\\migration\\memory\\records.jsonl',
+        present: false,
+      }],
+      summary: { total: 1, pending: 1, present: 0, skipped: 2 },
+    },
+    mcp: {
+      targetPath: 'C:\\Users\\ASUS\\.workbuddy\\mcp.json',
+      targetExists: true,
+      servers: [{
+        id: 'k1',
+        serverName: 'rea',
+        transport: 'stdio' as const,
+        command: 'node.exe',
+        args: ['rea.mjs'],
+        secretKeys: ['env'],
+        sourcePath: 'C:\\Users\\ASUS\\.dsh\\profiles\\web\\cordis.patch.yml',
+        status: 'new' as const,
+      }],
+      summary: { total: 1, new: 1, present: 0, conflict: 0, secretKeys: 1 },
+    },
+    automations: {
+      available: true,
+      automations: [{
+        id: 'a1',
+        title: '每日巡检',
+        prompt: '检查磁盘',
+        scheduleType: 'recurring' as const,
+        rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=30',
+        status: 'new' as const,
+      }],
+      summary: { total: 1, pending: 1, present: 0, unsupported: 0 },
+    },
     summary: { total: 1, new: 1, ahead: 0, synced: 0, workbuddyAhead: 0, conflict: 0, empty: 0, failed: 0, pendingRows: 4, lastSyncedSessions: 0 },
   }
 }
@@ -116,6 +158,17 @@ describe('export routes', () => {
     expect(reply.status).toBe(200)
     expect(preview).toHaveBeenCalledWith({ refresh: false })
     // The absolute path never leaves the host.
+    expect(JSON.stringify(reply.body)).not.toContain('ASUS')
+  })
+
+  it('keeps the three non-session boards in the preview payload', async () => {
+    const routes = mount({ preview: async () => previewStub() })
+    const reply = await call(routes.get(MIGRATION_EXPORT_PREVIEW_PATH)!, { method: 'GET' })
+    const body = reply.body as Record<string, any>
+    expect(body.memories.summary).toMatchObject({ pending: 1, skipped: 2 })
+    expect(body.mcp.servers[0]).toMatchObject({ serverName: 'rea', secretKeys: ['env'] })
+    expect(body.automations.automations[0]).toMatchObject({ rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=30' })
+    // Their paths are redacted just like a transcript path.
     expect(JSON.stringify(reply.body)).not.toContain('ASUS')
   })
 
@@ -154,6 +207,33 @@ describe('export routes', () => {
     })
     expect(reply.status).toBe(200)
     expect(run).toHaveBeenCalledWith({ sessionIds: ['session-a'], mode: 'new-session', exitConfirmed: true })
+  })
+
+  it('forwards the board selections and drops empty ones', async () => {
+    const run = vi.fn(async () => exportResultStub(0))
+    const routes = mount({ run })
+    await call(routes.get(MIGRATION_EXPORT_RUN_PATH)!, {
+      method: 'POST',
+      body: {
+        confirmed: true,
+        exitConfirmed: true,
+        memoryIds: ['m1'],
+        mcpIds: ['k1'],
+        automationIds: [],
+      },
+    })
+    expect(run).toHaveBeenCalledWith({ memoryIds: ['m1'], mcpIds: ['k1'], exitConfirmed: true })
+  })
+
+  it('accepts a run that only touches the boards', async () => {
+    const run = vi.fn(async () => exportResultStub(0))
+    const routes = mount({ run })
+    const reply = await call(routes.get(MIGRATION_EXPORT_RUN_PATH)!, {
+      method: 'POST',
+      body: { confirmed: true, exitConfirmed: true, automationIds: ['a1'] },
+    })
+    expect(reply.status).toBe(200)
+    expect(run).toHaveBeenCalledWith({ automationIds: ['a1'], exitConfirmed: true })
   })
 
   it('answers 409, not 500, when WorkBuddy is still running', async () => {

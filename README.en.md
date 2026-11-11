@@ -7,8 +7,9 @@ The plugin works out of the box and splits the settings page into two boards:
 - **Import data** (WorkBuddy → DSH): **scan → preview → explicit confirmation → import → auditable
   manifest**. Opening the page performs only a local **read-only** scan; it never copies, moves, or
   modifies WorkBuddy data.
-- **Export data** (DSH → WorkBuddy): appends only what is new since a per-session watermark, and
-  refuses to write until WorkBuddy has fully exited.
+- **Export data** (DSH → WorkBuddy): appends only what is new since a per-session watermark, offers the
+  matching memories / MCP / scheduled-task boards, and refuses to write until WorkBuddy has fully
+  exited.
 
 ## Compatibility
 
@@ -37,6 +38,8 @@ DSH → WorkBuddy export direction (see the export section below).
 
 **v0.4.4** fixes "the export board says there is nothing to export although the session clearly has new turns": the DSH 0.2.x session backends no longer expose `inspect()`, and `list()` now returns snapshots that nest the header. The export side therefore failed to read any events and every session id stringified to `"undefined"`, so all sessions rendered as empty. Reads now probe capabilities (`inspect` → `open/read` → `load`) and accept either `list()` shape.
 
+**v0.4.5** adds the three boards the export direction was missing (memories / MCP / scheduled tasks), so the export side mirrors import one for one, and fixes the "select sessions precisely" dialog whose left workspace column was so wide the right pane was squeezed out of sight.
+
 ## Install
 
 The package ships a `cordis.patch.yml` and declares itself a profile bundle through
@@ -47,7 +50,7 @@ hand-written composition row needed.
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.4/dsh-plugin-migration-workbuddy-0.4.4.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.5/dsh-plugin-migration-workbuddy-0.4.5.tgz
 ```
 
 The tarball already contains a built `lib/`: measured at **one command, ~3 seconds, exit 0**, with no
@@ -56,7 +59,7 @@ The tarball already contains a built `lib/`: measured at **one command, ~3 secon
 ### From GitHub by tag (needs a build permission)
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.4
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.5
 ```
 
 A git install fetches **sources, not built artifacts**, so this package ships a `prepare` script that
@@ -93,8 +96,8 @@ dsh plugin --profile <name> add /absolute/path/to/dsh-plugin-migration-workbuddy
 ### Packing your own tarball / publishing to a registry
 
 ```bash
-pnpm pack     # produces dsh-plugin-migration-workbuddy-0.4.4.tgz (runs prepare, so it includes lib/)
-dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.4.tgz
+pnpm pack     # produces dsh-plugin-migration-workbuddy-0.4.5.tgz (runs prepare, so it includes lib/)
+dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.5.tgz
 
 # once published to a registry (flip package.json private to false and pick a license first)
 dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
@@ -208,6 +211,40 @@ around one rule: **neither side's history may be lost**, so the default is appen
 - **Undo**: each export records a batch (row offsets, DB effects, created session ids). "Undo the last
   export" truncates the appended rows and reclaims created sessions. Truncation keeps the watermark,
   so the next export appends that stretch again.
+
+### Memories, MCP and scheduled tasks (export side)
+
+Everything "Import data" can carry has a counterpart on the export board, each selected independently:
+
+| Board | Destination | Conflict policy |
+| --- | --- | --- |
+| Memories | A block delimited by `<!-- dsh-migration:begin/end -->` inside `~/.workbuddy/MEMORY.md` | Only that block is replaced; your own sections are never touched |
+| MCP | `mcpServers` in `~/.workbuddy/mcp.json` | An existing name is left exactly as it is and reported as a conflict |
+| Scheduled tasks | The `automations` table in `workbuddy.db` | An automation with the same name counts as present and is skipped |
+
+Each target is backed up before it is written (`MEMORY.md.dsh-backup-<batch>`,
+`mcp.json.dsh-backup-<batch>`, `workbuddy.db`), and "Undo the last export" restores them together with
+the sessions.
+
+Three boundaries are worth knowing up front:
+
+- **Credentials are never copied.** For MCP only the `env` / `headers` **key names** are kept; the
+  values are dropped during parsing. A server that needs them is written `"disabled": true`, and you
+  re-enter the token in WorkBuddy before enabling it — a server that is enabled but missing its
+  credentials would just fail on every call.
+- **Memories are filtered first.** The records the import wrote include many lines that are nothing but
+  structural markers (`---`, `<!-- RAW_JSON_START -->`, `"memoryBlock": ""`, `> Version: 0`). Those are
+  not exported, and the panel says how many were skipped. On this machine all 30 are of that kind —
+  WorkBuddy's own `memoryBlock` is empty — so **0 pending memories is the correct answer**, not a
+  read failure.
+- **Scheduled tasks only translate to RRULE.** `daily` / `weekly` / `rrule` / `at` map exactly; `cron`
+  has no equivalent, and `every` / `after` (fixed interval, delayed) do not exist in WorkBuddy at all.
+  Those are marked "cannot convert" and skipped, so create them by hand.
+- **DSH has no enumerable MCP or schedule registry.** Both boards therefore read what DSH really
+  persists: the `cordis.patch.yml` files in profiles and bundles that mount
+  `@deepseek-ai/dsh-mcp-client` (`serverName` / `transport` / `command` / `url`, with commented-out
+  entries ignored), plus the `list()` surface of the `schedule` service. When neither exists the board
+  says there is nothing to export instead of inventing data.
 
 ## Security boundaries
 

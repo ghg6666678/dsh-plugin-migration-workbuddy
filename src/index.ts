@@ -3,6 +3,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { Config, normalizeMigrationConfig } from './config.js'
+import type { ExportScheduleService } from './export-service.js'
 import { ExportService } from './export-service.js'
 import { registerExportRoutes, registerMigrationRoutes } from './routes.js'
 import { MigrationService } from './service.js'
@@ -14,6 +15,22 @@ export const ConfigSchema = Config
 /** A deployment-provided channel that persists one imported automation rule. */
 interface AutomationImportChannel {
   saveRule?: (rule: unknown) => Promise<unknown>
+}
+
+/**
+ * The Host's `schedule` service, when one is mounted.
+ *
+ * `@deepseek-ai/dsh-schedule` is not a dependency of this plugin and is absent
+ * from the base bundle, so the lookup must stay optional. `ctx.get` throws when
+ * a service is unregistered, which is why it is wrapped rather than null-tested.
+ */
+function scheduleServiceOf(ctx: Context): ExportScheduleService | undefined {
+  try {
+    const service = ctx.get('schedule') as ExportScheduleService | undefined
+    return typeof service?.list === 'function' ? service : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** The plugin is available by default; import routes remain preview-first. */
@@ -49,8 +66,14 @@ export function apply(ctx: Context, rawConfig: Partial<ReturnType<typeof normali
   // The DSH -> WorkBuddy direction is a separate service: it writes into
   // another application's data directory, keeps its own journal, and refuses to
   // run while WorkBuddy is alive.
+  //
+  // Scheduled tasks live in the `schedule` service, which only some bundles
+  // mount. It is looked up optionally: without it the export board reports
+  // "this Host mounts no schedule service" instead of failing to load.
+  const schedule = scheduleServiceOf(ctx)
   const exporter = new ExportService(ctx.sessionPersistence, {
     ...(config.workbuddyRoot === '' ? {} : { root: config.workbuddyRoot }),
+    ...(schedule === undefined ? {} : { schedule }),
   })
   ctx.effect(
     () => registerExportRoutes(ctx.webServer, exporter),
@@ -64,6 +87,7 @@ export * from './probe.js'
 export * from './converter.js'
 export * from './exporter.js'
 export * from './export-service.js'
+export * from './export-boards.js'
 export * from './workbuddy-process.js'
 export * from './memory.js'
 export * from './mcp.js'

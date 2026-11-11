@@ -24,6 +24,13 @@ export interface MigrationLocale {
   exportWorking: string; exportDone: string; exportFailed: string
   exportRows: string; exportCreated: string; exportAppended: string; exportSkipped: string; exportPendingImport: string
   exportUndo: string; exportUndoDone: string; exportHistory: string; exportLastExported: string; exportNever: string
+  exportMemoriesHint: string; exportMemoriesEmpty: string; exportMemoriesFiltered: string; exportMemoriesTarget: string
+  exportMemoriesPending: string; exportMemoriesPresent: string
+  exportMcpHint: string; exportMcpEmpty: string; exportMcpTarget: string; exportMcpNew: string; exportMcpConflict: string
+  exportMcpSecrets: string; exportMcpSecretNote: string
+  exportAutomationsHint: string; exportAutomationsEmpty: string; exportAutomationsUnavailable: string
+  exportAutomationsUnsupported: string; exportAutomationsPending: string; exportAutomationsPresent: string
+  exportBoardsSection: string; exportBoardsNothing: string; exportWritten: string
 }
 const zhBase = {
   nav: '迁移与备份', title: '把 WorkBuddy 带入 DSH', intro: '安全地带回你的会话、记忆与连接器配置，先预览、再确认，一次完成迁移。', sourceFound: '已发现 WorkBuddy 数据', sourceMissing: '未发现 WorkBuddy 数据', refresh: '重新扫描', sessions: '会话', memories: '记忆', mcp: 'MCP 配置', automations: '自动化任务', sessionsHint: '保留消息、推理、工具调用顺序与工作目录', sessionMode: '从 WorkBuddy 导入', workspaceMode: '空间模式', memoriesHint: '逐条预览、去重后存入独立记忆空间', mcpHint: '仅迁移名称、地址与传输方式，凭据需重新配置', automationsHint: '导入定时任务：提示词、排程与目标工作区（不含运行历史）', automationNone: '没有可迁移的自动化任务', automationOnce: '单次', automationPermission: '权限按 DSH 组合默认（更安全，不继承 WorkBuddy 全权限）', automationLive: '导入后规则即按计划生效，可在自动化页随时停用', selectAll: '全选可迁移内容', safeTitle: '你的数据由你掌控', safeBody: '迁移只读取本机文件。Token、Cookie、API Key 和 OAuth 凭据永远不会被复制。', preview: '正在生成预览…', begin: '开始一键迁移', confirmTitle: '确认开始迁移？', confirmBody: '这会把选中的内容写入当前项目。重复内容会自动跳过，敏感凭据不会迁移。', cancel: '取消', confirm: '确认迁移', working: '正在迁移，请稍候…', done: '迁移完成', failed: '迁移失败', imported: '已导入', skipped: '已跳过', lossy: '降级项', secrets: '敏感字段已保护', importErrors: '导入错误', archive: '归档本次导入', viewManifest: '查看审计清单', auditTitle: '迁移审计清单', auditClose: '关闭', auditEmpty: '还没有迁移记录', auditSessions: '会话记录', auditMemories: '记忆记录', auditMcp: 'MCP 配置', noData: '没有找到可迁移内容', loadFailed: '扫描失败，请稍后重试', runFailed: '迁移失败，请检查数据后重试', noSessions: '没有发现会话', noMemories: '没有发现记忆',
@@ -45,7 +52,26 @@ export const zh: MigrationLocale = Object.assign(zhBase, { newItems: '新增', c
   exportQuitConfirm: '我确认所有会话都已执行完毕，并已完全退出 WorkBuddy', exportQuitCancel: '去退出 WorkBuddy',
   exportWorking: '正在导出，请稍候…', exportDone: '导出完成', exportFailed: '导出失败',
   exportRows: '写入记录', exportCreated: '新建会话', exportAppended: '追加会话', exportSkipped: '已跳过', exportPendingImport: '这些会话在 WorkBuddy 中有更新的内容，请用「导入数据」拉回来',
-  exportUndo: '撤销上一次导出', exportUndoDone: '已撤销上一次导出', exportHistory: '导出历史', exportLastExported: '最近导出', exportNever: '尚未导出过' })
+  exportUndo: '撤销上一次导出', exportUndoDone: '已撤销上一次导出', exportHistory: '导出历史', exportLastExported: '最近导出', exportNever: '尚未导出过',
+  exportMemoriesHint: '把 DSH 侧的记忆追加到 WorkBuddy 的 MEMORY.md，写在带标记的区块里，你原有的内容不会被改写',
+  exportMemoriesEmpty: 'DSH 侧没有可导出的记忆',
+  exportMemoriesFiltered: '已跳过 {skipped} 条只含结构标记、没有实际内容的记录',
+  exportMemoriesTarget: '目标文件',
+  exportMemoriesPending: '待追加', exportMemoriesPresent: '已存在',
+  exportMcpHint: '把 DSH 挂载的 MCP 服务器写入 WorkBuddy 的 mcp.json，同名条目保持原样、不覆盖',
+  exportMcpEmpty: 'DSH 侧没有挂载 MCP 服务器',
+  exportMcpTarget: '目标文件',
+  exportMcpNew: '待新增',
+  exportMcpConflict: 'WorkBuddy 已有同名但配置不同的服务器，将保留现有条目',
+  exportMcpSecrets: '这些条目带环境变量或请求头，其值不会被复制，导出后为停用状态',
+  exportMcpSecretNote: '凭据需要你在 WorkBuddy 里重新填写',
+  exportAutomationsHint: '把 DSH 的定时任务写入 WorkBuddy 的自动化列表（RRULE 排程；cron 与固定间隔无法等价转换）',
+  exportAutomationsEmpty: 'DSH 侧没有定时任务',
+  exportAutomationsUnavailable: '当前 DSH 没有挂载定时任务服务，无法读取定时任务',
+  exportAutomationsUnsupported: '排程形式无法转换，导出会跳过；请在 WorkBuddy 里手动新建',
+  exportAutomationsPending: '待新建', exportAutomationsPresent: '已存在',
+  exportBoardsSection: '记忆、MCP 与定时任务',
+  exportBoardsNothing: '这三个板块都没有待导出的内容', exportWritten: '已写入' })
 const enBase = {
   nav: 'Migration & backup', title: 'Bring WorkBuddy into DSH', intro: 'Bring your sessions, memories, and connector drafts home — preview first, confirm once, and migrate safely.', sourceFound: 'WorkBuddy data found', sourceMissing: 'WorkBuddy data not found', refresh: 'Scan again', sessions: 'Sessions', memories: 'Memories', mcp: 'MCP configs', automations: 'Automation tasks', sessionsHint: 'Preserve messages, reasoning, tool order, and working directories', sessionMode: 'WorkBuddy imports', workspaceMode: 'workspace mode', memoriesHint: 'Preview each item, deduplicate, and keep it in a private memory space', mcpHint: 'Only names, URLs, and transports move; credentials are reconfigured', automationsHint: 'Import scheduled tasks: prompts, schedules, and target workspaces (no run history)', automationNone: 'No migratable automation tasks', automationOnce: 'once', automationPermission: 'Permissions follow the DSH composition default (safer; WorkBuddy full access is not carried over)', automationLive: 'Imported rules take effect on schedule; disable them anytime in the automation page', selectAll: 'Select all available data', safeTitle: 'You stay in control', safeBody: 'Migration reads local files only. Tokens, cookies, API keys, and OAuth credentials are never copied.', preview: 'Building preview…', begin: 'Start one-click migration', confirmTitle: 'Start migration?', confirmBody: 'Selected data will be written into this project. Duplicates are skipped and secrets stay behind.', cancel: 'Cancel', confirm: 'Confirm migration', working: 'Migrating, please wait…', done: 'Migration complete', failed: 'Migration failed', imported: 'Imported', skipped: 'Skipped', lossy: 'Lossy fields', secrets: 'Secrets protected', importErrors: 'Import errors', archive: 'Archive this import', viewManifest: 'View audit manifest', auditTitle: 'Migration audit manifest', auditClose: 'Close', auditEmpty: 'No migration records yet', auditSessions: 'Session records', auditMemories: 'Memory records', auditMcp: 'MCP configs', noData: 'No migratable data found', loadFailed: 'Scan failed, please retry', runFailed: 'Migration failed, check the source and retry', noSessions: 'No sessions found', noMemories: 'No memories found',
 }
@@ -66,4 +92,23 @@ export const en: MigrationLocale = Object.assign(enBase, { newItems: 'New', chan
   exportQuitConfirm: 'All conversations are finished and WorkBuddy is fully quit', exportQuitCancel: 'Let me quit WorkBuddy',
   exportWorking: 'Exporting, please wait…', exportDone: 'Export complete', exportFailed: 'Export failed',
   exportRows: 'Rows written', exportCreated: 'New sessions', exportAppended: 'Appended', exportSkipped: 'Skipped', exportPendingImport: 'These sessions have newer content in WorkBuddy; bring it back with "Import data"',
-  exportUndo: 'Undo last export', exportUndoDone: 'Last export undone', exportHistory: 'Export history', exportLastExported: 'Last exported', exportNever: 'Never exported' })
+  exportUndo: 'Undo last export', exportUndoDone: 'Last export undone', exportHistory: 'Export history', exportLastExported: 'Last exported', exportNever: 'Never exported',
+  exportMemoriesHint: 'Append DSH-side memories to WorkBuddy\'s MEMORY.md inside a marked block; your own sections are never rewritten',
+  exportMemoriesEmpty: 'No memories on the DSH side',
+  exportMemoriesFiltered: 'Skipped {skipped} record(s) that held only structural markers, no real content',
+  exportMemoriesTarget: 'Target file',
+  exportMemoriesPending: 'Pending', exportMemoriesPresent: 'Already there',
+  exportMcpHint: 'Write DSH-mounted MCP servers into WorkBuddy\'s mcp.json; an existing name is left exactly as it is',
+  exportMcpEmpty: 'No MCP servers mounted on the DSH side',
+  exportMcpTarget: 'Target file',
+  exportMcpNew: 'Pending',
+  exportMcpConflict: 'WorkBuddy already has a server with this name but a different config; the existing entry wins',
+  exportMcpSecrets: 'These entries carry environment variables or headers whose values are never copied; they are exported disabled',
+  exportMcpSecretNote: 'You need to re-enter the credentials in WorkBuddy',
+  exportAutomationsHint: 'Write DSH scheduled tasks into WorkBuddy\'s automation list (RRULE schedules; cron and fixed intervals have no equivalent)',
+  exportAutomationsEmpty: 'No scheduled tasks on the DSH side',
+  exportAutomationsUnavailable: 'This DSH mounts no schedule service, so scheduled tasks cannot be read',
+  exportAutomationsUnsupported: 'This schedule has no equivalent and will be skipped; create it by hand in WorkBuddy',
+  exportAutomationsPending: 'Pending', exportAutomationsPresent: 'Already there',
+  exportBoardsSection: 'Memories, MCP and scheduled tasks',
+  exportBoardsNothing: 'Nothing to export in any of these three boards', exportWritten: 'Written' })

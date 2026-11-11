@@ -11,6 +11,12 @@ export interface ExportRunInput {
   /** Proof that the user confirmed every WorkBuddy conversation finished and it was quit. */
   exitConfirmed: true
   sessionIds?: string[]
+  /** Memory record ids; omit the key to mean "everything pending". */
+  memoryIds?: string[]
+  /** MCP server draft ids; omit the key to mean "everything pending". */
+  mcpIds?: string[]
+  /** Schedule ids; omit the key to mean "everything pending". */
+  automationIds?: string[]
   mode?: 'auto' | 'new-session'
   refresh?: boolean
 }

@@ -251,6 +251,106 @@ export interface ExportSessionSummary {
   detail?: string
 }
 
+/**
+ * One DSH-side fact an export would append to WorkBuddy's `MEMORY.md`.
+ *
+ * DSH keeps no memory store of its own, so the only honest source is what the
+ * import direction already captured: the manifest and its JSONL record file.
+ */
+export interface ExportMemorySummary {
+  id: string
+  /** Single-line memory text, verbatim. */
+  content: string
+  /** Where the record came from: the import manifest or the live record file. */
+  source: 'manifest' | 'record'
+  sourcePath: string
+  createdAt?: string
+  /** True when WorkBuddy's MEMORY.md already carries this line. */
+  present: boolean
+}
+
+export interface ExportMemoryBoard {
+  /** The WorkBuddy file the export appends to. */
+  targetPath: string
+  targetExists: boolean
+  records: ExportMemorySummary[]
+  summary: {
+    total: number
+    pending: number
+    present: number
+    /** Records dropped because they carry no reusable knowledge. */
+    skipped: number
+  }
+}
+
+export type ExportMcpStatus = 'new' | 'present' | 'conflict'
+
+/**
+ * One MCP server an export would register in WorkBuddy's `mcp.json`.
+ *
+ * DSH's `dsh-mcp-client` exposes no registry, so servers are recovered from the
+ * profile patch files that mount them plus the import manifest.
+ */
+export interface ExportMcpSummary {
+  id: string
+  /** The `mcpServers` key this entry occupies. */
+  serverName: string
+  transport: 'stdio' | 'streamable-http'
+  command?: string
+  args: string[]
+  url?: string
+  /**
+   * Names of `env` / `headers` entries whose values were never read. WorkBuddy
+   * stores literal values, so these must be filled in by hand.
+   */
+  secretKeys: string[]
+  sourcePath: string
+  status: ExportMcpStatus
+  detail?: string
+}
+
+export interface ExportMcpBoard {
+  targetPath: string
+  targetExists: boolean
+  servers: ExportMcpSummary[]
+  summary: {
+    total: number
+    new: number
+    present: number
+    conflict: number
+    /** Secret-bearing keys across every pending server. */
+    secretKeys: number
+  }
+}
+
+export type ExportAutomationStatus = 'new' | 'present' | 'unsupported'
+
+/** One DSH scheduled task an export would create as a WorkBuddy automation. */
+export interface ExportAutomationSummary {
+  id: string
+  title: string
+  prompt: string
+  scheduleType: 'recurring' | 'once'
+  /** RRULE text WorkBuddy stores; absent for one-shot or unsupported rules. */
+  rrule?: string
+  scheduledAt?: string
+  status: ExportAutomationStatus
+  detail?: string
+}
+
+export interface ExportAutomationBoard {
+  /** False when this Host mounts no schedule service at all. */
+  available: boolean
+  detail?: string
+  automations: ExportAutomationSummary[]
+  summary: {
+    total: number
+    pending: number
+    present: number
+    unsupported: number
+  }
+}
+
 export interface ExportPreview {
   exportFormatVersion: number
   generatedAt: string
@@ -264,6 +364,13 @@ export interface ExportPreview {
     checkedAt: string
   }
   sessions: ExportSessionSummary[]
+  /**
+   * The three non-session boards. They mirror the import direction's memory,
+   * MCP and automation boards so both sides offer the same categories.
+   */
+  memories: ExportMemoryBoard
+  mcp: ExportMcpBoard
+  automations: ExportAutomationBoard
   summary: {
     total: number
     new: number
@@ -301,9 +408,26 @@ export interface ExportResult {
     created: boolean
   }>
   errors: Array<{ sessionId: string; message: string }>
+  /** What the run wrote into WorkBuddy's `MEMORY.md`. */
+  memories: { written: number; skipped: number; targetPath: string; backupPath?: string }
+  /** What the run wrote into WorkBuddy's `mcp.json`. */
+  mcp: { written: number; skipped: number; targetPath: string; backupPath?: string; secretKeys: string[] }
+  /** What the run wrote into WorkBuddy's `automations` table. */
+  automations: { written: number; skipped: number; unsupported: number; backupPath?: string }
   /**
    * Sessions whose newer content exists only in WorkBuddy. Exporting cannot
    * bring it across, so the result points the user at the import direction.
    */
   pendingImport: Array<{ sessionId: string; title?: string }>
+}
+
+/** Input for the export direction's non-session boards. */
+export interface ExportBoardsInput {
+  confirmed: true
+  exitConfirmed: true
+  /** Omit an array to mean "everything eligible on that board". */
+  memoryIds?: string[]
+  mcpIds?: string[]
+  automationIds?: string[]
+  refresh?: boolean
 }

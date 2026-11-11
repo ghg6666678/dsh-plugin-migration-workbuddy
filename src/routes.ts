@@ -137,6 +137,22 @@ function redactExportPreview(value: Awaited<ReturnType<ExportService['preview']>
       ...item,
       transcriptPath: item.transcriptPath === '' ? '' : sanitizePathForPreview(item.transcriptPath),
     })),
+    memories: {
+      ...value.memories,
+      targetPath: sanitizePathForPreview(value.memories.targetPath),
+      records: value.memories.records.map(item => ({
+        ...item,
+        sourcePath: sanitizePathForPreview(item.sourcePath),
+      })),
+    },
+    mcp: {
+      ...value.mcp,
+      targetPath: sanitizePathForPreview(value.mcp.targetPath),
+      servers: value.mcp.servers.map(item => ({
+        ...item,
+        sourcePath: sanitizePathForPreview(item.sourcePath),
+      })),
+    },
   }
 }
 
@@ -264,8 +280,14 @@ export function registerExportRoutes(webserver: WebServer, exporter: ExportServi
           if (input.confirmed !== true) { sendJson(res, 400, { error: 'explicit confirmation required' }); return }
           if (input.exitConfirmed !== true) { sendJson(res, 400, { error: 'exitConfirmed required: quit WorkBuddy before exporting' }); return }
           let sessionIds: string[] | undefined
+          let memoryIds: string[] | undefined
+          let mcpIds: string[] | undefined
+          let automationIds: string[] | undefined
           try {
             sessionIds = sanitizeSessionFilter(input.sessionIds, 'sessionIds')
+            memoryIds = sanitizeSessionFilter(input.memoryIds, 'memoryIds')
+            mcpIds = sanitizeSessionFilter(input.mcpIds, 'mcpIds')
+            automationIds = sanitizeSessionFilter(input.automationIds, 'automationIds')
           } catch (cause) {
             sendJson(res, 400, { error: cause instanceof Error ? cause.message : String(cause) }); return
           }
@@ -274,6 +296,9 @@ export function registerExportRoutes(webserver: WebServer, exporter: ExportServi
             ...(input.mode === 'new-session' ? { mode: 'new-session' as const } : {}),
             exitConfirmed: true,
             ...(input.refresh === true ? { refresh: true } : {}),
+            ...(memoryIds.length > 0 ? { memoryIds } : {}),
+            ...(mcpIds.length > 0 ? { mcpIds } : {}),
+            ...(automationIds.length > 0 ? { automationIds } : {}),
           }))
           return
         }

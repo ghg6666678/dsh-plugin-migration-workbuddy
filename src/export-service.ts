@@ -29,7 +29,28 @@ import {
   sessionRowPath,
   workBuddySessionPath,
 } from './exporter.js'
-import type { ExportPreview, ExportResult, ExportSessionStatus, ExportSessionSummary } from './model.js'
+import {
+  backupFile,
+  mergeMcpDocument,
+  mergeMemoryBlock,
+  readExportAutomations,
+  readExportMcp,
+  readExportMemories,
+  removeMcpServers,
+  removeMemoryBlock,
+  toAutomationRow,
+  writeTextAtomic,
+  type ScheduleEntryLike,
+} from './export-boards.js'
+import type {
+  ExportAutomationBoard,
+  ExportMcpBoard,
+  ExportMemoryBoard,
+  ExportPreview,
+  ExportResult,
+  ExportSessionStatus,
+  ExportSessionSummary,
+} from './model.js'
 import { WORKBUDDY_EXPORT_FORMAT_VERSION } from './model.js'
 import { detectWorkBuddy, workBuddyRoot, type WorkBuddyActivity } from './workbuddy-process.js'
 
@@ -163,6 +184,12 @@ interface ExportBatchRecord {
   activity: string[]
   sessions: BatchSessionRecord[]
   dbBackup?: string
+  /** What the batch appended to `MEMORY.md`, for the summary and a later retry. */
+  memories?: { written: number; backupPath: string; ids: string[] }
+  /** What the batch added to `mcp.json`. */
+  mcp?: { written: number; backupPath: string; names: string[] }
+  /** Automation rows the batch inserted, so undo can remove exactly those. */
+  automations?: { written: number; ids: string[] }
   error?: string
 }
 
@@ -472,6 +499,55 @@ export interface ExportServiceOptions {
   activity?: () => WorkBuddyActivity
   /** Override for tests; defaults to a real SQLite connection. */
   openDatabase?: (root: string) => ExportDatabase
+  /**
+   * Override for tests; defaults to asking the Host's schedule service. Returns
+   * `undefined` when this Host mounts no schedule service at all.
+   */
+  scheduleEntries?: () => Promise<readonly ScheduleEntryLike[] | undefined>
+  /** Override for tests; defaults to reading WorkBuddy's `automations` names. */
+  automationNames?: () => string[]
+  /** Override for tests; defaults to the process clock. */
+  now?: () => number
+  /**
+   * The Host's schedule service, when this deployment mounts one. It is fetched
+   * by the plugin entry so the export board can mirror the import board's
+   * automations column.
+   */
+  schedule?: ExportScheduleService
+}
+
+/** The slice of `@deepseek-ai/dsh-schedule`'s service the export board reads. */
+export interface ExportScheduleService {
+  /** Returns `{ items, … }` in 0.2.x; a bare array is tolerated for older hosts. */
+  list(request?: { active?: boolean }): Promise<readonly ScheduleEntryLike[] | { items?: readonly ScheduleEntryLike[] }> | readonly ScheduleEntryLike[] | { items?: readonly ScheduleEntryLike[] }
+}
+
+/**
+ * The names WorkBuddy already uses, so a re-run updates nothing by surprise.
+ *
+ * Read through the same read-only connection `readWorkBuddyAutomations` uses in
+ * the import direction: a name collision means the automation is already there.
+ */
+export function existingAutomationNames(root: string): string[] {
+  const source = join(root, 'workbuddy.db')
+  if (!existsSync(source)) return []
+  let db: DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(source, { readOnly: true })
+    const rows = db.prepare('SELECT name FROM automations WHERE deleted_at IS NULL').all() as Array<{ name?: unknown }>
+    return rows.map(row => text(row.name)).filter((value): value is string => value !== undefined)
+  } catch {
+    return []
+  } finally {
+    try { db?.close() } catch { /* already closed */ }
+  }
+}
+
+/** The non-session halves of one export, computed without writing. */
+interface BoardPlan {
+  memories: ExportMemoryBoard
+  mcp: ExportMcpBoard
+  automations: ExportAutomationBoard
 }
 
 /** Everything one session needs, computed without writing. */
@@ -495,6 +571,7 @@ export class ExportService {
   readonly journalPath: string
   readonly backupDir: string
   readonly root: string
+  readonly dshHome: string
   private journal?: ExportJournal
   private cache: { at: number; plans: Plan[] } | undefined
 
@@ -503,9 +580,14 @@ export class ExportService {
     private readonly options: ExportServiceOptions = {},
   ) {
     const dshHome = options.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+    this.dshHome = dshHome
     this.root = options.root ?? workBuddyRoot()
     this.journalPath = join(dshHome, 'migration', 'export.json')
     this.backupDir = join(dshHome, 'migration', 'export-backups')
+  }
+
+  private now(): number {
+    return (this.options.now ?? Date.now)()
   }
 
   private activity(): WorkBuddyActivity {
@@ -679,7 +761,7 @@ export class ExportService {
   async preview(options: { refresh?: boolean } = {}): Promise<ExportPreview> {
     const activity = this.activity()
     if (options.refresh !== true && this.cache !== undefined && Date.now() - this.cache.at < 15_000) {
-      return this.view(this.cache.plans, activity)
+      return await this.view(this.cache.plans, activity)
     }
     const journal = this.state()
     const mappings = this.importMappings()
@@ -718,10 +800,10 @@ export class ExportService {
     }
     plans.sort((left, right) => right.summary.createdAt - left.summary.createdAt)
     this.cache = { at: Date.now(), plans }
-    return this.view(plans, activity)
+    return await this.view(plans, activity)
   }
 
-  private view(plans: readonly Plan[], activity: WorkBuddyActivity): ExportPreview {
+  private async view(plans: readonly Plan[], activity: WorkBuddyActivity): Promise<ExportPreview> {
     const sessions = plans.map(item => item.summary)
     const count = (status: ExportSessionStatus): number => sessions.filter(item => item.status === status).length
     const stamps = this.state().sessions
@@ -729,12 +811,16 @@ export class ExportService {
       .filter((value): value is string => value !== undefined)
       .sort()
     const lastExportedAt = stamps.at(-1)
+    const boards = await this.boards()
     return {
       exportFormatVersion: WORKBUDDY_EXPORT_FORMAT_VERSION,
       generatedAt: new Date().toISOString(),
       workbuddyRoot: this.root,
       activity,
       sessions,
+      memories: boards.memories,
+      mcp: boards.mcp,
+      automations: boards.automations,
       summary: {
         total: sessions.length,
         new: count('new'),
@@ -751,9 +837,162 @@ export class ExportService {
     }
   }
 
+  /**
+   * Ask the Host's schedule service for its catalog.
+   *
+   * DSH exposes scheduled tasks through the `schedule` service, which only some
+   * bundles mount. A missing service is a fact worth reporting, not an error.
+   */
+  private async scheduleCatalog(): Promise<{ entries?: readonly ScheduleEntryLike[]; detail?: string }> {
+    if (this.options.scheduleEntries !== undefined) {
+      const entries = await this.options.scheduleEntries()
+      return entries === undefined ? {} : { entries }
+    }
+    const service = this.options.schedule
+    if (service === undefined) {
+      return { detail: '当前 DSH 未挂载定时任务服务，无法读取定时任务' }
+    }
+    try {
+      const listed = await service.list({})
+      // 0.2.x answers `{ items, shown, total, ... }`; tolerate a bare array.
+      const entries: readonly ScheduleEntryLike[] = Array.isArray(listed)
+        ? listed as readonly ScheduleEntryLike[]
+        : Array.isArray((listed as { items?: unknown }).items)
+          ? (listed as { items: readonly ScheduleEntryLike[] }).items
+          : []
+      return { entries }
+    } catch (cause) {
+      return { detail: `读取定时任务失败：${cause instanceof Error ? cause.message : String(cause)}` }
+    }
+  }
+
+  /** Report what a memory/MCP/automation export would write. */
+  async boards(): Promise<BoardPlan> {
+    const memories = readExportMemories(this.dshHome, this.root)
+    const mcp = readExportMcp(this.dshHome, this.root)
+    const catalog = await this.scheduleCatalog()
+    const names = (this.options.automationNames ?? (() => existingAutomationNames(this.root)))()
+    const automations = readExportAutomations(catalog.entries, names, catalog.detail)
+    return { memories, mcp, automations }
+  }
+
+  /**
+   * Append the pending memories into `MEMORY.md`'s managed block.
+   *
+   * WorkBuddy keeps exactly one curated memory file, so the plugin owns a
+   * delimited block inside it and refreshes that block on every run. The user's
+   * own sections are copied through byte for byte.
+   */
+  private async writeMemories(
+    board: ExportMemoryBoard,
+    wanted: ReadonlySet<string> | undefined,
+    stamp: string,
+    result: ExportResult,
+    batch: ExportBatchRecord,
+  ): Promise<void> {
+    const pending = board.records.filter(item => !item.present && (wanted === undefined || wanted.has(item.id)))
+    result.memories.skipped = board.records.length - pending.length
+    if (pending.length === 0) return
+    try {
+      const existing = board.targetExists ? readFileSync(board.targetPath, 'utf8') : ''
+      const backupPath = backupFile(board.targetPath, stamp)
+      await writeTextAtomic(board.targetPath, mergeMemoryBlock(existing, pending.map(item => item.content)))
+      result.memories.written = pending.length
+      if (backupPath !== undefined) result.memories.backupPath = backupPath
+      batch.memories = { written: pending.length, backupPath: backupPath ?? '', ids: pending.map(item => item.id) }
+    } catch (cause) {
+      result.errors.push({
+        sessionId: 'memories',
+        message: cause instanceof Error ? cause.message : String(cause),
+      })
+    }
+  }
+
+  /**
+   * Register the pending MCP servers in WorkBuddy's `mcp.json`.
+   *
+   * Every existing entry is preserved verbatim; only brand-new names are added,
+   * and a server whose environment carried secrets is written disabled so the
+   * user completes it rather than getting a server that silently fails.
+   */
+  private async writeMcp(
+    board: ExportMcpBoard,
+    wanted: ReadonlySet<string> | undefined,
+    stamp: string,
+    result: ExportResult,
+    batch: ExportBatchRecord,
+  ): Promise<void> {
+    const pending = board.servers.filter(item => item.status === 'new' && (wanted === undefined || wanted.has(item.id)))
+    result.mcp.skipped = board.servers.length - pending.length
+    if (pending.length === 0) return
+    try {
+      const existing = board.targetExists ? readFileSync(board.targetPath, 'utf8') : undefined
+      const merged = mergeMcpDocument(existing, pending)
+      if (merged.added.length === 0) return
+      const backupPath = backupFile(board.targetPath, stamp)
+      await writeTextAtomic(board.targetPath, merged.content)
+      result.mcp.written = merged.added.length
+      result.mcp.secretKeys = [...new Set(pending.flatMap(item => item.secretKeys.map(key => `${item.serverName}.${key}`)))]
+      if (backupPath !== undefined) result.mcp.backupPath = backupPath
+      batch.mcp = { written: merged.added.length, backupPath: backupPath ?? '', names: merged.added }
+    } catch (cause) {
+      result.errors.push({
+        sessionId: 'mcp',
+        message: cause instanceof Error ? cause.message : String(cause),
+      })
+    }
+  }
+
+  /** Insert one `automations` row per pending DSH scheduled task. */
+  private writeAutomations(
+    board: ExportAutomationBoard,
+    wanted: ReadonlySet<string> | undefined,
+    result: ExportResult,
+    batch: ExportBatchRecord,
+  ): void {
+    const pending = board.automations.filter(item => item.status === 'new' && (wanted === undefined || wanted.has(item.id)))
+    result.automations.unsupported = board.automations.filter(item => item.status === 'unsupported').length
+    result.automations.skipped = board.automations.length - pending.length
+    if (pending.length === 0) return
+    let database: DatabaseSync | undefined
+    try {
+      database = new DatabaseSync(join(this.root, 'workbuddy.db'))
+      const stamp = `${batch.id}-${String(this.now())}`
+      batch.dbBackup ??= this.backupCatalog(stamp) ?? '（备份失败）'
+      const insert = database.prepare(
+        'INSERT INTO automations (id, name, prompt, status, schedule_type, rrule, scheduled_at, cwds, created_at, updated_at) '
+        + "VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)",
+      )
+      for (const item of pending) {
+        const row = toAutomationRow(item, this.now())
+        insert.run(
+          row.id,
+          row.name,
+          row.prompt,
+          row.status,
+          row.scheduleType,
+          row.rrule,
+          row.scheduledAt ?? null,
+          row.createdAt,
+          row.updatedAt,
+        )
+        result.automations.written += 1
+        batch.automations ??= { written: 0, ids: [] }
+        batch.automations.ids.push(row.id)
+        batch.automations.written += 1
+      }
+    } catch (cause) {
+      result.errors.push({
+        sessionId: 'automations',
+        message: cause instanceof Error ? cause.message : String(cause),
+      })
+    } finally {
+      try { database?.close() } catch { /* already closed */ }
+    }
+  }
+
   /** Copy the catalog aside before the first mutation of a batch. */
-  private backupCatalog(stamp: string): string | undefined {
-    const source = join(this.root, 'workbuddy.db')
+  private backupCatalog(stamp: string): string | undefined {    const source = join(this.root, 'workbuddy.db')
     if (!existsSync(source)) return undefined
     const target = join(this.backupDir, stamp)
     try {
@@ -798,14 +1037,23 @@ export class ExportService {
     mode?: 'auto' | 'new-session'
     exitConfirmed?: boolean
     refresh?: boolean
+    memoryIds?: string[]
+    mcpIds?: string[]
+    automationIds?: string[]
   }): Promise<ExportResult> {
     const activity = this.guard('导出', input.exitConfirmed)
     const journal = this.state()
     const wanted = input.sessionIds === undefined ? undefined : new Set(input.sessionIds)
-    if (wanted !== undefined && wanted.size === 0) throw new Error('未选择任何会话')
+    const memoryWanted = input.memoryIds === undefined ? undefined : new Set(input.memoryIds)
+    const mcpWanted = input.mcpIds === undefined ? undefined : new Set(input.mcpIds)
+    const automationWanted = input.automationIds === undefined ? undefined : new Set(input.automationIds)
+    const anyBoard = (set: ReadonlySet<string> | undefined): boolean => set === undefined || set.size > 0
+    const boardsSelected = anyBoard(memoryWanted) || anyBoard(mcpWanted) || anyBoard(automationWanted)
+    if (wanted !== undefined && wanted.size === 0 && !boardsSelected) throw new Error('未选择任何内容')
 
     await this.preview(input.refresh === true ? { refresh: true } : {})
     const plans = this.cache?.plans ?? []
+    const boardPlan = await this.boards()
     const batch: ExportBatchRecord = {
       id: `export-${Date.now().toString(36)}-${createHash('sha1').update(String(Math.random())).digest('hex').slice(0, 6)}`,
       startedAt: new Date().toISOString(),
@@ -824,6 +1072,9 @@ export class ExportService {
       rows: 0,
       sessions: [],
       errors: [],
+      memories: { written: 0, skipped: 0, targetPath: boardPlan.memories.targetPath },
+      mcp: { written: 0, skipped: 0, targetPath: boardPlan.mcp.targetPath, secretKeys: [] },
+      automations: { written: 0, skipped: 0, unsupported: 0 },
       pendingImport: [],
     }
 
@@ -990,6 +1241,14 @@ export class ExportService {
           created: createNew,
         })
       }
+
+      // The three non-session boards run after the transcripts so a board
+      // failure can never leave a half-written conversation behind.
+      const stamp = `${batch.id}-${String(this.now())}`
+      await this.writeMemories(boardPlan.memories, memoryWanted, stamp, result, batch)
+      await this.writeMcp(boardPlan.mcp, mcpWanted, stamp, result, batch)
+      this.writeAutomations(boardPlan.automations, automationWanted, result, batch)
+
       batch.status = 'completed'
     } catch (cause) {
       batch.status = 'failed'
@@ -1069,10 +1328,52 @@ export class ExportService {
       }
     }
     database?.close()
+    await this.undoBoards(batch)
     batch.status = 'undone'
     await this.persist(journal)
     this.cache = undefined
     return { undone: true, batchId: batch.id, files, sessions: batch.sessions.length }
+  }
+
+  /**
+   * Reverse the non-session halves of a batch.
+   *
+   * A backup is restored rather than reconstructed whenever one exists: that
+   * guarantees the user's own `MEMORY.md` wording and `mcp.json` ordering come
+   * back exactly as they were.
+   */
+  private async undoBoards(batch: ExportBatchRecord): Promise<void> {
+    if (batch.memories !== undefined && batch.memories.written > 0) {
+      try {
+        const target = join(this.root, 'MEMORY.md')
+        if (batch.memories.backupPath !== '' && existsSync(batch.memories.backupPath)) {
+          await writeTextAtomic(target, readFileSync(batch.memories.backupPath, 'utf8'))
+        } else if (existsSync(target)) {
+          const stripped = removeMemoryBlock(readFileSync(target, 'utf8'))
+          if (stripped !== undefined) await writeTextAtomic(target, stripped)
+        }
+      } catch { /* the journal keeps the intent for a retry */ }
+    }
+    if (batch.mcp !== undefined && batch.mcp.written > 0) {
+      try {
+        const target = join(this.root, 'mcp.json')
+        if (batch.mcp.backupPath !== '' && existsSync(batch.mcp.backupPath)) {
+          await writeTextAtomic(target, readFileSync(batch.mcp.backupPath, 'utf8'))
+        } else if (existsSync(target)) {
+          await writeTextAtomic(target, removeMcpServers(readFileSync(target, 'utf8'), batch.mcp.names))
+        }
+      } catch { /* the journal keeps the intent for a retry */ }
+    }
+    if (batch.automations !== undefined && batch.automations.ids.length > 0) {
+      let database: DatabaseSync | undefined
+      try {
+        database = new DatabaseSync(join(this.root, 'workbuddy.db'))
+        const remove = database.prepare('DELETE FROM automations WHERE id = ?')
+        for (const id of batch.automations.ids) remove.run(id)
+      } catch { /* leave the rows for a later retry */ } finally {
+        try { database?.close() } catch { /* already closed */ }
+      }
+    }
   }
 
   /** Batches newest-first, for the export panel's history list. */
