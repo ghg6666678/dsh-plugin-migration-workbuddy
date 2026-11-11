@@ -123,7 +123,12 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 
 function targetRoot(): string { return process.env.DSH_HOME ?? join(homedir(), '.dsh') }
 
-function sessionModeWorkspacePath(): string { return join(targetRoot(), 'workspaces', 'session-mode') }
+/** Directory (under `$DSH_HOME/workspaces`) that owns imported conversations. */
+const WORKBUDDY_WORKSPACE_DIR = 'workbuddy-imported'
+/** User-visible name of the imported-conversations workspace. */
+export const WORKBUDDY_WORKSPACE_TITLE = '从WorkBuddy导入的对话'
+
+function sessionModeWorkspacePath(): string { return join(targetRoot(), 'workspaces', WORKBUDDY_WORKSPACE_DIR) }
 
 function metadataHash(metadata: WorkBuddySessionMetadata | undefined): string {
   return createHash('sha256').update(JSON.stringify(metadata ? { sourceSessionId: metadata.sourceSessionId, mode: metadata.mode, cwd: metadata.cwd ?? null, title: metadata.title ?? null } : null)).digest('hex')
@@ -443,7 +448,7 @@ export class MigrationService {
         group = {
           id,
           path: rawPath ?? '',
-          ...(id === 'ungrouped' ? {} : { title: item.mode === 'session' ? '会话模式' : basename(rawPath ?? '') }),
+          ...(id === 'ungrouped' ? {} : { title: item.mode === 'session' ? WORKBUDDY_WORKSPACE_TITLE : basename(rawPath ?? '') }),
           mode: id === 'ungrouped' ? 'ungrouped' : (item.mode === 'session' ? 'session' : item.mode === 'workspace' ? 'workspace' : 'mixed'),
           count: 0, eligible: 0, newCount: 0, changedCount: 0, repairCount: 0, unchangedCount: 0, failedCount: 0,
         }
@@ -598,7 +603,7 @@ export class MigrationService {
           const workspacePath = metadata?.mode === 'session' ? sessionWorkspacePath : (converted.cwd ?? projectWorkspacePath(converted.projectHash))
           if (this.workspaceRegistry && workspacePath && existsSync(workspacePath)) {
             try {
-              const title = metadata?.mode === 'session' ? '会话模式' : basename(workspacePath)
+              const title = metadata?.mode === 'session' ? WORKBUDDY_WORKSPACE_TITLE : basename(workspacePath)
               const workspace = await this.workspaceRegistry.resolveByPath(workspacePath) ?? await this.workspaceRegistry.create(workspacePath, title)
               // dsh >= 0.2 rebuilds workspace membership from stored session
               // headers (cwd) at startup and has no attachSession method. Older

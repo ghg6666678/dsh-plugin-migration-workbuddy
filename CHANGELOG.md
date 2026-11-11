@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.4.0 — 2026-11-11
+
+导入会话改放到独立工作区「从WorkBuddy导入的对话」：
+
+- 新导入写入 `$DSH_HOME/workspaces/workbuddy-imported`，工作区显示名「从WorkBuddy导入的对话」；
+- 已有的 14 个导入会话已原地迁移：header `cwd`、日志目录、迁移清单、workspace 注册表一起更新；
+- 原「会话模式」工作区只保留非导入会话。
+
 ## v0.3.3 — 2026-11-11
 
 按 WorkBuddy 自己的压缩方式保留长期记忆：
