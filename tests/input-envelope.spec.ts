@@ -55,4 +55,48 @@ describe('WorkBuddy input envelope', () => {
   it('supports a query wrapper without the context wrapper', () => {
     expect(parseWorkBuddyInput('<user_query>hello</user_query>').text).toBe('hello')
   })
+
+  it('folds a background task notification into the context row', () => {
+    const parsed = parseWorkBuddyInput([
+      '<task-notification>',
+      '<task-id>lkTfSj</task-id>',
+      '<status>completed</status>',
+      '<summary>Background command "build" completed with exit code 0</summary>',
+      '</task-notification>',
+      '',
+      'Use the TaskOutput tool with task_id="lkTfSj" to retrieve unread output if you need to act on it.',
+      '[SYSTEM NOTIFICATION - NOT USER INPUT] This is an automated background-task event.',
+    ].join('\n'))
+    expect(parsed.text).toBe('')
+    expect(parsed.hadContext).toBe(true)
+    expect(parsed.contextSections).toEqual(expect.arrayContaining([
+      { name: '后台任务', text: expect.stringContaining('lkTfSj') },
+    ]))
+  })
+
+  it('folds a compaction summary into the context row', () => {
+    const parsed = parseWorkBuddyInput([
+      '<cb_summary>',
+      'Summary of the conversation so far:',
+      'The conversation is between an AI agent and a user.',
+      '</cb_summary>',
+    ].join('\n'))
+    expect(parsed.text).toBe('')
+    expect(parsed.contextSections).toEqual(expect.arrayContaining([
+      { name: '历史压缩摘要', text: expect.stringContaining('Summary of the conversation') },
+    ]))
+  })
+
+  it('keeps a quoted message as a section and the reply as the human text', () => {
+    const parsed = parseWorkBuddyInput([
+      '<message_quote type="text" source_message_id="m1">',
+      '<original_text><![CDATA[被引用的原文]]></original_text>',
+      '</message_quote>',
+      '帮我把这个字体换掉',
+    ].join('\n'))
+    expect(parsed.text).toBe('帮我把这个字体换掉')
+    expect(parsed.contextSections).toEqual(expect.arrayContaining([
+      { name: '引用消息', text: '被引用的原文' },
+    ]))
+  })
 })

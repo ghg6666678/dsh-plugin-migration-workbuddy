@@ -85,6 +85,55 @@ function isGeneratedContext(openTag: string, body: string): boolean {
     || /<user_info\s*>|<identity_context\s*>|<product_identity\s*>/iu.test(body)
 }
 
+const TASK_NOTIFICATION = /<task-notification\b[^>]*>([\s\S]*?)<\/task-notification\s*>/giu
+const SUMMARY_BLOCK = /<(cb_summary|conversation_history_summary)\b[^>]*>([\s\S]*?)<\/\1\s*>/giu
+const MESSAGE_QUOTE = /<message_quote\b[^>]*>([\s\S]*?)<\/message_quote\s*>/giu
+
+function tagBody(source: string, tag: string): string | undefined {
+  return source.match(new RegExp(`<${tag}\\s*>([\\s\\S]*?)<\\/${tag}\\s*>`, 'iu'))?.[1]
+}
+
+/**
+ * Pull WorkBuddy's non-conversational payloads out of the visible message:
+ * background-task notifications, compaction summaries, and quoted messages.
+ * They are real context, but rendering their raw XML as a user bubble is wrong.
+ */
+function extractGeneratedBlocks(raw: string, sections: ContextSnapshotSection[]): string {
+  let text = raw
+
+  text = text.replace(TASK_NOTIFICATION, (_whole, body: string) => {
+    const id = tagBody(body, 'task-id')?.trim()
+    const status = tagBody(body, 'status')?.trim()
+    const summary = tagBody(body, 'summary')?.trim()
+    sections.push({
+      name: '后台任务',
+      text: [id === undefined ? '后台任务通知' : `任务 ${id}`, status === undefined ? '' : `状态: ${status}`, summary ?? ''].filter(Boolean).join('\n'),
+    })
+    return ''
+  })
+  // A task notification is followed by an automated instruction paragraph.
+  const rest = text.trim()
+  if (rest !== '' && /\[SYSTEM NOTIFICATION - NOT USER INPUT\]|^Use the TaskOutput tool/iu.test(rest)) text = ''
+
+  text = text.replace(SUMMARY_BLOCK, (_whole, kind: string, body: string) => {
+    const trimmed = body.trim()
+    const clipped = trimmed.length > 20_000 ? `${trimmed.slice(0, 20_000)}\n…（已截断，原始摘要共 ${String(trimmed.length)} 字）` : trimmed
+    sections.push({ name: kind === 'cb_summary' ? '历史压缩摘要' : '历史摘要', text: clipped })
+    return ''
+  })
+
+  text = text.replace(MESSAGE_QUOTE, (_whole, body: string) => {
+    const quote = tagBody(body, 'original_text')
+      ?.replace(/^\s*<!\[CDATA\[/u, '')
+      .replace(/\]\]>\s*$/u, '')
+      .trim()
+    if (quote !== undefined && quote !== '') sections.push({ name: '引用消息', text: quote })
+    return ''
+  })
+
+  return text
+}
+
 /**
  * Split WorkBuddy's generated prompt envelope from the human query.
  * This is intentionally a small tag scanner rather than a broad HTML stripper:
@@ -132,7 +181,10 @@ export function parseWorkBuddyInput(raw: string): WorkBuddyInputEnvelope {
     hadQuery = true
     return value.trim()
   })
-  const text = [...queries, unwrappedOutside].map(value => value.trim()).filter(Boolean).join('\n\n').trim()
+  const joined = [...queries, unwrappedOutside].map(value => value.trim()).filter(Boolean).join('\n\n').trim()
+  const before = joined
+  const text = extractGeneratedBlocks(joined, contextSections).trim()
+  if (text !== before) hadContext = true
   const deduped = contextSections.filter((item, index, all) => all.findIndex(candidate => candidate.name === item.name && candidate.text === item.text) === index)
   return { text, contextSections: deduped, hadContext, hadQuery, warnings }
 }
