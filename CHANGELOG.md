@@ -1,5 +1,19 @@
 # 更新日志
 
+## v0.3.1 — 2026-11-11
+
+修复「导入会话继续对话时报 tool_use 错误、重启后判损坏」：
+
+1. **工具调用块位置**：assistant/message 里若 `tool-call` 之后还有文本块，Anthropic 风格的
+   provider 会报 `tool_use ids were found without tool_result blocks immediately after`。
+   转换器现在把 tool-call 块一律排到消息末尾（推理/文本在前）。
+2. **system head**：种子会话缺少 `system/message` 作为首个 surface 事件。续聊时运行时会追加自己的
+   system/message，而格式要求它必须挂在受保护的 first surface head 上，否则重启后报
+   `system/message requires a protected first surface head`。转换器现在在第一个 step 开头写入一条
+   `system/message`（role system / source system-prompt）。
+
+14 个已导入会话已就地重写（会话 id 不变），宿主加载校验 14/14 通过。
+
 ## v0.3.0 — 2026-11-11
 
 在「迁移与备份」设置页增加「导入设置」：

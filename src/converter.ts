@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { basename, isAbsolute, relative, sep } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -180,6 +180,7 @@ class TurnAssembler {
   private turnOpen = false
   private stepOpen = false
   private stepHasResults = false
+  private systemHeadEmitted = false
   private bufferedBlocks: ContentBlock[] = []
   private bufferedCalls: PendingCall[] = []
   private readonly outstanding = new Map<string, PendingCall>()
@@ -227,6 +228,29 @@ class TurnAssembler {
     this.stepOpen = true
     this.stepHasResults = false
     this.event('step/start', { turn: this.turn, step: this.step }, time)
+    // A seeded session must carry a protected system head: when the user later
+    // continues it, the runtime appends its real system/message and the format
+    // only accepts that after a first surface head exists.
+    if (!this.systemHeadEmitted && this.turn === 1 && this.step === 1) {
+      this.systemHeadEmitted = true
+      this.events.push({
+        type: 'system/message',
+        seq: SessionSeq(this.seq),
+        time,
+        surfaceOp: 'append',
+        data: {
+          turn: this.turn,
+          step: this.step,
+          message: {
+            id: randomUUID(),
+            role: 'system',
+            source: { kind: 'system-prompt' },
+            content: [{ type: 'text', text: 'WorkBuddy 导入的历史记录（系统提示由当前部署在后续轮次重新提供）。' }],
+          },
+        },
+      } as unknown as SessionEvent)
+      this.seq += 1
+    }
   }
 
   /** Emit the buffered assistant message and its tool calls in the current step. */
@@ -234,7 +258,14 @@ class TurnAssembler {
     if (this.bufferedBlocks.length === 0 && this.bufferedCalls.length === 0) return
     this.ensureStep(time)
     if (this.bufferedBlocks.length > 0) {
-      const message = createAssistantMessage({ content: this.bufferedBlocks, source: { provider: 'workbuddy', model: 'imported' } })
+      // Tool calls must be the last content blocks: providers reject a
+      // `tool_use` that is followed by more assistant text instead of the
+      // matching `tool_result`.
+      const ordered = [
+        ...this.bufferedBlocks.filter(block => block.type !== 'tool-call'),
+        ...this.bufferedBlocks.filter(block => block.type === 'tool-call'),
+      ]
+      const message = createAssistantMessage({ content: ordered, source: { provider: 'workbuddy', model: 'imported' } })
       this.surface('assistant/message', { turn: this.turn, step: this.step, message }, time)
     }
     for (const call of this.bufferedCalls) {

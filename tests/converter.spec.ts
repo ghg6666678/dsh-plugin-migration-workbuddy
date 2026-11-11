@@ -5,6 +5,13 @@ import { describe, expect, it } from 'vitest'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { convertWorkBuddySession } from '../src/converter.js'
 
+/** The pinned test peer predates system/message; derive messages without it. */
+function derivable(events: readonly unknown[]): never[] {
+  return (events as Array<{ type?: string; seq?: number }>)
+    .filter(item => item.type !== 'system/message')
+    .map((item, index) => ({ ...item, seq: index })) as never[]
+}
+
 describe('WorkBuddy converter', () => {
   it('keeps message order, reasoning and tool events in a contiguous DSH log', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mwb-converter-'))
@@ -41,7 +48,7 @@ describe('WorkBuddy converter', () => {
     ].join('\n'))
 
     const converted = await convertWorkBuddySession(path, root)
-    const session = Session.create(SessionId('workbuddy-tool-pair'), converted.events as never[])
+    const session = Session.create(SessionId('workbuddy-tool-pair'), derivable(converted.events))
     const messages = session.deriveMessages()
     expect(messages.map(message => message.role)).toEqual(['assistant', 'user', 'user'])
     expect(messages[0]?.content[0]).toMatchObject({ type: 'tool-call', id: 'c1', name: 'read' })
@@ -59,7 +66,7 @@ describe('WorkBuddy converter', () => {
     ].join('\n'))
 
     const converted = await convertWorkBuddySession(path, root)
-    const session = Session.create(SessionId('workbuddy-tool-repair'), converted.events as never[])
+    const session = Session.create(SessionId('workbuddy-tool-repair'), derivable(converted.events))
     const messages = session.deriveMessages()
     const calls = messages.flatMap(message => message.content.filter(block => block.type === 'tool-call'))
     const results = messages.flatMap(message => message.content.filter(block => block.type === 'tool-result'))
@@ -107,7 +114,8 @@ describe('WorkBuddy converter', () => {
     expect(converted.mode).toBe('session')
     expect(converted.cwd).toBe('/target/session-mode')
     expect(converted.events[0]).toMatchObject({ type: 'session/title', data: { title: '正式标题', messageSeqs: [], source: { kind: 'user' } } })
-    expect(converted.events.map(event => Number((event as { seq: number }).seq))).toEqual([0, 1, 2, 3, 4, 5])
+    expect(converted.events[3]).toMatchObject({ type: 'system/message', surfaceOp: 'append', data: { message: { role: 'system', source: { kind: 'system-prompt' } } } })
+    expect(converted.events.map(event => Number((event as { seq: number }).seq))).toEqual([0, 1, 2, 3, 4, 5, 6])
   })
 
   it('emits one tool output per call id when WorkBuddy repeats a result row', async () => {
@@ -122,7 +130,7 @@ describe('WorkBuddy converter', () => {
     ].join('\n'))
 
     const converted = await convertWorkBuddySession(path, root)
-    const session = Session.create(SessionId('workbuddy-dup-result'), converted.events as never[])
+    const session = Session.create(SessionId('workbuddy-dup-result'), derivable(converted.events))
     const messages = session.deriveMessages()
     const calls = messages.flatMap(message => message.content.filter(block => block.type === 'tool-call'))
     const results = messages.flatMap(message => message.content.filter(block => block.type === 'tool-result'))
@@ -142,7 +150,7 @@ describe('WorkBuddy converter', () => {
     ].join('\n'))
 
     const converted = await convertWorkBuddySession(path, root, undefined, { toolMode: 'narrative' })
-    const session = Session.create(SessionId('workbuddy-narrative'), converted.events as never[])
+    const session = Session.create(SessionId('workbuddy-narrative'), derivable(converted.events))
     const messages = session.deriveMessages()
     const calls = messages.flatMap(message => message.content.filter(block => block.type === 'tool-call'))
     const results = messages.flatMap(message => message.content.filter(block => block.type === 'tool-result'))
@@ -167,7 +175,7 @@ describe('WorkBuddy converter', () => {
     ].join('\n'))
 
     const converted = await convertWorkBuddySession(path, root)
-    const session = Session.create(SessionId('workbuddy-dup-call'), converted.events as never[])
+    const session = Session.create(SessionId('workbuddy-dup-call'), derivable(converted.events))
     const messages = session.deriveMessages()
     const calls = messages.flatMap(message => message.content.filter(block => block.type === 'tool-call'))
     const results = messages.flatMap(message => message.content.filter(block => block.type === 'tool-result'))
@@ -212,6 +220,6 @@ describe('WorkBuddy converter', () => {
     expect(types.filter(type => type === 'tool/call')).toHaveLength(1)
     expect(types.filter(type => type === 'tool/result')).toHaveLength(1)
     expect(types.filter(type => type === 'turn/start')).toHaveLength(2)
-    Session.create(SessionId('workbuddy-delayed-result'), converted.events as never[])
+    Session.create(SessionId('workbuddy-delayed-result'), derivable(converted.events))
   })
 })
