@@ -183,6 +183,21 @@ async function inspectMemory(root: string, warnings: ProbeWarning[], maxFiles: n
     }
     if (files.length >= maxFiles) break
   }
+  // The curated memory the user actually sees lives at the root as MEMORY.md.
+  // The `memory/` directory only holds the per-account profile scaffolding, so
+  // scanning directories alone reported "4 memories" that were JSON braces
+  // while the real notes were never read. USER.md / IDENTITY.md / SOUL.md /
+  // BOOTSTRAP.md are persona templates, not notes, so they stay out.
+  for (const name of ['MEMORY.md']) {
+    const path = join(root, name)
+    try {
+      const info = await lstat(path)
+      if (info.isSymbolicLink() || !info.isFile()) continue
+      files.push(path)
+    } catch {
+      // An absent root MEMORY.md is expected; nothing to scan.
+    }
+  }
   const candidates: MemoryCandidate[] = []
   for (const path of files) {
     try {

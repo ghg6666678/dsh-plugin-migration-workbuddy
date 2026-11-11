@@ -199,6 +199,64 @@ describe('MigrationService deleted sessions', () => {
   })
 })
 
+describe('MigrationService memory import', () => {
+  it('imports the curated MEMORY.md and prunes scaffolding stored by older builds', async () => {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-mem-source-'))
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-mem-target-'))
+    await mkdir(join(sourceRoot, 'memory'), { recursive: true })
+    // The per-account profile is scaffolding; the curated notes live at the root.
+    await writeFile(join(sourceRoot, 'memory', 'uid_memory.md'), [
+      '# User Memory Profile',
+      '> Last updated: 2026-11-11T15:38:18.430Z',
+      '> Version: 0',
+      '',
+      '## Memory Block',
+      '',
+      '',
+      '---',
+      '<!-- RAW_JSON_START',
+      '{',
+      '  "memoryBlock": "",',
+      '}',
+      'RAW_JSON_END -->',
+    ].join('\n'))
+    await writeFile(join(sourceRoot, 'MEMORY.md'), '# MEMORY.md\n\n## 经验\n\n- 真实笔记一\n- 真实笔记二\n')
+
+    // Simulate the store a pre-fix release left behind.
+    await mkdir(join(targetRoot, 'migration', 'memory'), { recursive: true })
+    const noise = JSON.stringify({
+      id: 'stale', content: '> Last updated: 2026-11-10T17:35:01.983Z',
+      sourcePath: join(sourceRoot, 'memory', 'uid_memory.md'), sourceHash: 'h', enabled: true, createdAt: '2026-11-10T00:00:00.000Z',
+    })
+    await writeFile(join(targetRoot, 'migration', 'memory', 'records.jsonl'), `${noise}\n`)
+    await writeFile(join(targetRoot, 'migration', 'manifest.json'), JSON.stringify({
+      version: 2, createdAt: '2026-11-10T00:00:00.000Z', updatedAt: '2026-11-10T00:00:00.000Z',
+      sessions: [], mcp: [], automations: [],
+      memories: [JSON.parse(noise)],
+    }))
+
+    const persistence = { create: async () => undefined, append: async () => undefined }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      const preview = await service.preview()
+      expect(preview.memories.flatMap(item => item.records.map(record => record.content)))
+        .toEqual(['真实笔记一', '真实笔记二'])
+
+      const result = await service.migrate({ sessions: false, memories: true, mcp: false })
+      expect(result.importedMemories).toBe(2)
+
+      const stored = (await readFile(join(targetRoot, 'migration', 'memory', 'records.jsonl'), 'utf8'))
+        .split('\n').filter(Boolean).map(line => JSON.parse(line) as { content: string })
+      expect(stored.map(item => item.content)).toEqual(['真实笔记一', '真实笔记二'])
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+})
+
 describe('MigrationService settings', () => {
   it('persists the per-file limit and applies it to probing', async () => {
     const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-settings-source-'))

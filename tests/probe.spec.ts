@@ -41,6 +41,29 @@ describe('WorkBuddy P0 probe', () => {
     expect(report.warnings[0]?.code).toBe('missing-root')
   })
 
+  it('scans the root MEMORY.md alongside the memory directory', async () => {
+    // The curated notes live at <root>/MEMORY.md; `memory/` only holds the
+    // per-account scaffolding. Missing the root file made import report a
+    // handful of JSON-brace "memories" and never see the real ones.
+    const root = await fixture()
+    await writeFile(join(root, 'MEMORY.md'), '# MEMORY.md\n\n## 经验\n\n- 真实笔记\n')
+    const report = await probeWorkBuddy({ root })
+    const scanned = report.memoryCandidates.map(candidate => candidate.path)
+    expect(scanned).toContain(join(root, 'MEMORY.md'))
+    expect(summarizeProbe(report).memoryCount).toBe(2)
+  })
+
+  it('does not treat persona templates as memory candidates', async () => {
+    const root = await fixture()
+    for (const name of ['USER.md', 'IDENTITY.md', 'SOUL.md', 'BOOTSTRAP.md']) {
+      await writeFile(join(root, name), `# ${name}\n\n- 尚未告知\n`)
+    }
+    const report = await probeWorkBuddy({ root })
+    const scanned = report.memoryCandidates.map(candidate => candidate.path)
+    expect(scanned).not.toContain(join(root, 'USER.md'))
+    expect(summarizeProbe(report).memoryCount).toBe(1)
+  })
+
   it('redacts a home prefix for preview display', () => {
     expect(displayPath('/Users/alice/.workbuddy/projects', '/Users/alice')).toBe('~/.workbuddy/projects')
     expect(displayPath('/var/tmp/workbuddy', '/Users/alice')).toBe('/var/tmp/workbuddy')

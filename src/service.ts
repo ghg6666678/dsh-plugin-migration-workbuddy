@@ -10,7 +10,7 @@ import type {
   McpDraft, MemoryRecord, MigrationPreview, MigrationResult, MigrationSelection, ProbeReport, WorkspaceSummary,
 } from './model.js'
 import { MIGRATION_FORMAT_VERSION } from './model.js'
-import { parseMemoryCandidate, toMemoryRecords } from './memory.js'
+import { parseMemoryCandidate, pruneScaffoldingRecords, toMemoryRecords } from './memory.js'
 import { sanitizeMcpConfig } from './mcp.js'
 import { readWorkBuddyAutomations, resolveAutomationModel, toAutomationDraft, type AutomationDraft, type AutomationModelPolicy } from './automation.js'
 import { defaultWorkBuddyRoot, displayPath, probeWorkBuddy } from './probe.js'
@@ -632,6 +632,12 @@ export class MigrationService {
       }
       if (selection.memories) {
         const previews = (await this.preview()).memories
+        // Earlier releases parsed only the per-account profile in `memory/`,
+        // so the store holds scaffolding rows (`{`, `---`, `"uid": "…"`) while
+        // the curated `MEMORY.md` was never read. Prune the leftovers so the
+        // import repairs itself instead of leaving permanent noise behind.
+        const pruned = pruneScaffoldingRecords(manifest.memories)
+        manifest.memories = pruned.kept
         const merged = toMemoryRecords(previews, manifest.memories)
         manifest.memories = [...manifest.memories, ...merged.records]
         result.importedMemories = merged.records.length; result.skippedMemories = merged.skipped; batch.importedMemories = merged.records.length

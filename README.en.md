@@ -1,4 +1,4 @@
-# dsh-plugin-migration-workbuddy
+﻿# dsh-plugin-migration-workbuddy
 
 Migrate WorkBuddy sessions, memories, MCP drafts, and automation tasks into DSH.
 
@@ -40,6 +40,8 @@ DSH → WorkBuddy export direction (see the export section below).
 
 **v0.4.5** adds the three boards the export direction was missing (memories / MCP / scheduled tasks), so the export side mirrors import one for one, and fixes the "select sessions precisely" dialog whose left workspace column was so wide the right pane was squeezed out of sight (the split now adapts to the panel's own width via a container query).
 
+**v0.4.6** fixes memory import reading the wrong file: older builds scanned only `~/.workbuddy/memory/`, which holds nothing but the per-account profile scaffolding (`> Version: 0`, `RAW_JSON_START`, `"memoryBlock": ""`), while the curated notes live in the root `MEMORY.md` and were never read. "Imported 20 memories" was really 20 lines of JSON braces, so the export board could not pick out a single usable item. `MEMORY.md` is now scanned and scaffolding lines (YAML headers, `RAW_JSON` blocks, `key: value` metadata) are filtered out; every memory import also drops the scaffolding rows older builds stored, so no hand-editing of `manifest.json` is needed.
+
 ## Install
 
 The package ships a `cordis.patch.yml` and declares itself a profile bundle through
@@ -50,7 +52,7 @@ hand-written composition row needed.
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.5/dsh-plugin-migration-workbuddy-0.4.5.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.6/dsh-plugin-migration-workbuddy-0.4.6.tgz
 ```
 
 The tarball already contains a built `lib/`: measured at **one command, ~3 seconds, exit 0**, with no
@@ -59,7 +61,7 @@ The tarball already contains a built `lib/`: measured at **one command, ~3 secon
 ### From GitHub by tag (needs a build permission)
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.5
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.6
 ```
 
 A git install fetches **sources, not built artifacts**, so this package ships a `prepare` script that

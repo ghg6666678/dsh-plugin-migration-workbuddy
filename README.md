@@ -1,4 +1,4 @@
-# dsh-plugin-migration-workbuddy
+﻿# dsh-plugin-migration-workbuddy
 
 把 WorkBuddy 的会话、记忆、MCP 配置与自动化任务迁移进 DSH。
 
@@ -38,6 +38,12 @@
 **v0.4.5** 补上导出方向缺的三块（记忆 / MCP / 定时任务），导入有什么导出就有什么；同时修掉「精确选择
 会话」弹窗左侧目录栏过宽、右侧内容被挤没了的问题（分栏改为按面板自身宽度自适应的容器查询）。
 
+**v0.4.6** 修掉记忆导入读错文件：旧版只扫 `~/.workbuddy/memory/`，而那里只有每账号的档案脚手架
+（`> Version: 0`、`RAW_JSON_START`、`"memoryBlock": ""`），真正的记忆在根目录的 `MEMORY.md`，
+从来没被读过。结果「导入了 20 条记忆」其实是 20 行 JSON 括号，导出侧自然一条可用内容都挑不出来。
+现在把 `MEMORY.md` 纳入扫描，并滤掉 YAML 头、`RAW_JSON` 块、`key: value` 元数据这类无实质内容的行；
+另外每次记忆导入会自动清掉旧版残留的脚手架记录，不用手工改 `manifest.json`。
+
 ## 安装
 
 本包自带 `cordis.patch.yml`，并通过 `dsh.bundle.patch` 声明自己是 profile bundle：`dsh plugin add`
@@ -47,7 +53,7 @@
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.5/dsh-plugin-migration-workbuddy-0.4.5.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.6/dsh-plugin-migration-workbuddy-0.4.6.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -56,7 +62,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.5
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.6
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从
