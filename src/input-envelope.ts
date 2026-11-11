@@ -59,9 +59,10 @@ function summarizeSystemContext(source: string): ContextSnapshotSection[] {
   if (projectSection) result.push(projectSection)
 
   const additional = elementBody(source, 'additional_data') ?? ''
+  const runtimeSources = additional === '' ? [source] : [additional, source]
   const runtime = [
-    ...values(additional, /<current_time\s*>([\s\S]*?)<\/current_time\s*>/giu).map(value => `当前时间: ${value}`),
-    ...values(additional, /<connector-status\s*>([\s\S]*?)<\/connector-status\s*>/giu).map(value => `连接器: ${value}`),
+    ...runtimeSources.flatMap(value => values(value, /<current_time\s*>([\s\S]*?)<\/current_time\s*>/giu).map(time => `当前时间: ${time}`)),
+    ...runtimeSources.flatMap(value => values(value, /<connector-status\s*>([\s\S]*?)<\/connector-status\s*>/giu).map(status => `连接器: ${status}`)),
   ]
   const runtimeSection = section('运行状态', runtime)
   if (runtimeSection) result.push(runtimeSection)
@@ -75,7 +76,12 @@ function summarizeSystemContext(source: string): ContextSnapshotSection[] {
 }
 
 function isGeneratedContext(openTag: string, body: string): boolean {
-  return /data-role\s*=\s*["']user-context["']/iu.test(openTag)
+  // WorkBuddy wraps generated prompt material in system-reminder blocks. The
+  // `user-context` block carries the environment snapshot; the
+  // `additional-data` block carries the clock/connector preamble that appears
+  // at the top of every turn. Both are app-generated and must not be shown as
+  // part of the human message.
+  return /data-role\s*=\s*["'](?:user-context|additional-data)["']/iu.test(openTag)
     || /<user_info\s*>|<identity_context\s*>|<product_identity\s*>/iu.test(body)
 }
 

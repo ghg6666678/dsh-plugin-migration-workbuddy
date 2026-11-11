@@ -22,6 +22,24 @@ describe('WorkBuddy input envelope', () => {
     expect(JSON.stringify(parsed.contextSections)).not.toContain('secret body')
   })
 
+  it('strips the additional-data preamble that opens every turn', () => {
+    const parsed = parseWorkBuddyInput([
+      '<system-reminder data-role="additional-data">',
+      '<current_time>',
+      'Wednesday, November 4, 2026 at 09:45:11 GMT+8',
+      '</current_time>',
+      '</system-reminder>',
+      '',
+      '请检查构建结果',
+    ].join('\n'))
+    expect(parsed.text).toBe('请检查构建结果')
+    expect(parsed.text).not.toContain('system-reminder')
+    expect(parsed.hadContext).toBe(true)
+    expect(parsed.contextSections).toEqual(expect.arrayContaining([
+      { name: '运行状态', text: expect.stringContaining('当前时间:') },
+    ]))
+  })
+
   it('keeps user-authored markup outside a generated envelope', () => {
     const parsed = parseWorkBuddyInput('请保留 <system-reminder> 这段文字')
     expect(parsed.text).toBe('请保留 <system-reminder> 这段文字')

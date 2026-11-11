@@ -1,5 +1,21 @@
 # 更新日志
 
+## v0.1.7 — 2026-11-11
+
+修复导入消息开头残留 WorkBuddy 生成头的问题：
+
+```
+<system-reminder data-role="additional-data">
+<current_time>Wednesday, November 4, 2026 at 09:45:11 GMT+8</current_time>
+</system-reminder>
+```
+
+输入解析器只识别 `data-role="user-context"` 的 reminder；`additional-data`（每轮开头的时间/连接器
+前导）此前被当成用户正文保留。现在两类生成块都会剥离：`<current_time>`/连接器状态归入「运行状态」
+上下文摘要，消息正文只保留 `<user_query>` 里的人工输入。
+
+13 个已导入会话已就地重写（会话 id 不变），并全部通过宿主加载校验。
+
 ## v0.1.6 — 2026-11-11
 
 修复「工具调用没有结果就结束 step」导致的加载失败：
