@@ -177,7 +177,7 @@ export function ExportPanel({ t, api }: ExportPanelProps): React.ReactElement {
                   <span className="mwb-migration-row-title">{item.title ?? item.id}</span>
                   <span className="mwb-migration-row-sub">{item.detail ?? `${item.eventCount} 条事件 · ${String(rowCount(item))} 条待写入`}</span>
                 </span>
-                <span className="mwb-migration-badge" data-kind={item.status}>{statusLabel(item.status)}</span>
+                <span className="mwb-migration-badge" data-kind={item.status} title={item.detail ?? undefined}>{statusLabel(item.status)}</span>
               </button>)}
           </div>}
 
