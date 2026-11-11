@@ -117,7 +117,9 @@ function extractGeneratedBlocks(raw: string, sections: ContextSnapshotSection[])
 
   text = text.replace(SUMMARY_BLOCK, (_whole, kind: string, body: string) => {
     const trimmed = body.trim()
-    const clipped = trimmed.length > 20_000 ? `${trimmed.slice(0, 20_000)}\n…（已截断，原始摘要共 ${String(trimmed.length)} 字）` : trimmed
+    // WorkBuddy's compaction summaries *are* its long-term memory (100k+ chars).
+    // Keep them intact; only guard against pathological input.
+    const clipped = trimmed.length > 600_000 ? `${trimmed.slice(0, 600_000)}\n…（已截断，原始摘要共 ${String(trimmed.length)} 字）` : trimmed
     sections.push({ name: kind === 'cb_summary' ? '历史压缩摘要' : '历史摘要', text: clipped })
     return ''
   })

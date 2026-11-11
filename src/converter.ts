@@ -67,6 +67,46 @@ function ensureSystemHead(events: SessionEvent[]): SessionEvent[] {
  * whole transcript is sent as history. Keeping the most recent turns and a
  * protected system head keeps the session continuable.
  */
+type MemorySection = { name: string; text: string; index: number }
+
+/**
+ * WorkBuddy keeps its long-term memory as a giant rolling compaction summary
+ * (`cb_summary`) plus a short task summary. When the raw history is trimmed,
+ * that summary is what stops the model from forgetting the project's start.
+ */
+function pickMemorySummary(events: SessionEvent[]): MemorySection | undefined {
+  let comprehensive: MemorySection | undefined
+  let latest: MemorySection | undefined
+  for (const [index, event] of events.entries()) {
+    if (event.type !== 'user/message') continue
+    const sections = (event as unknown as { data?: { source?: { sections?: unknown } } }).data?.source?.sections
+    if (!Array.isArray(sections)) continue
+    for (const section of sections) {
+      if (section === null || typeof section !== 'object') continue
+      const candidate = section as { name?: unknown; text?: unknown }
+      if (typeof candidate.name !== 'string' || typeof candidate.text !== 'string' || candidate.text === '') continue
+      if (candidate.name === '历史压缩摘要') comprehensive = { name: candidate.name, text: candidate.text, index }
+      else if (candidate.name === '历史摘要') latest = { name: candidate.name, text: candidate.text, index }
+    }
+  }
+  return comprehensive ?? latest
+}
+
+function memorySummaryEvent(section: { name: string; text: string }, time: number): SessionEvent {
+  return {
+    type: 'user/message',
+    seq: 0,
+    time,
+    surfaceOp: 'append',
+    data: {
+      ...createUserMessage({
+        content: content(section.text),
+        source: { kind: 'plugin', plugin: 'WorkBuddy 历史摘要', form: 'snapshot', sections: [section] },
+      }),
+    },
+  } as unknown as SessionEvent
+}
+
 export function trimEventsToBudget(events: SessionEvent[], budgetChars: number): { events: SessionEvent[]; droppedTurns: number } {
   if (budgetChars <= 0 || events.length === 0) return { events, droppedTurns: 0 }
   const starts: number[] = []
@@ -78,16 +118,19 @@ export function trimEventsToBudget(events: SessionEvent[], budgetChars: number):
   for (const turn of turns) for (const event of turn) total += JSON.stringify(event).length
   if (total <= budgetChars) return { events, droppedTurns: 0 }
 
+  const memory = pickMemorySummary(events)
+  const memoryChars = memory === undefined ? 0 : Math.min(memory.text.length, Math.floor(budgetChars * 0.5))
+  const turnBudget = Math.max(20_000, budgetChars - memoryChars)
   let accumulated = 0
   let keepFrom = turns.length
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     accumulated += turns[index]!.reduce((sum, event) => sum + JSON.stringify(event).length, 0)
-    if (accumulated > budgetChars) break
+    if (accumulated > turnBudget) break
     keepFrom = index
   }
   if (keepFrom === 0) keepFrom = 1
   if (keepFrom >= turns.length) keepFrom = turns.length - 1
-  const kept = [...prefix, ...turns.slice(keepFrom).flat()]
+  let kept = [...prefix, ...turns.slice(keepFrom).flat()]
   // Turn numbers are one-based and sequential in DSH; renumber the kept window.
   const firstTurn = kept.find(event => event.type === 'turn/start')
   const baseTurn = firstTurn === undefined ? 1 : Number((firstTurn.data as { turn: number }).turn)
@@ -95,9 +138,18 @@ export function trimEventsToBudget(events: SessionEvent[], budgetChars: number):
     const data = (event as unknown as { data?: { turn?: unknown } }).data
     if (data !== undefined && typeof data.turn === 'number') data.turn = data.turn - baseTurn + 1
   }
-  const withHead = ensureSystemHead(kept)
-  for (let index = 0; index < withHead.length; index += 1) (withHead[index] as unknown as { seq: number }).seq = index
-  return { events: withHead, droppedTurns: keepFrom }
+  kept = ensureSystemHead(kept)
+  // Re-inject the compaction summary when it fell outside the kept window.
+  if (memory !== undefined && memory.index < starts[keepFrom]!) {
+    const stepIndex = kept.findIndex(event => event.type === 'step/start')
+    const injected = memorySummaryEvent(
+      { name: memory.name, text: memoryChars < memory.text.length ? `${memory.text.slice(0, memoryChars)}\n…（摘要已按上下文预算截断）` : memory.text },
+      kept[stepIndex + 1]?.time ?? Date.now(),
+    )
+    kept = [...kept.slice(0, stepIndex + 2), injected, ...kept.slice(stepIndex + 2)]
+  }
+  for (let index = 0; index < kept.length; index += 1) (kept[index] as unknown as { seq: number }).seq = index
+  return { events: kept, droppedTurns: keepFrom }
 }
 
 export interface ConvertOptions {
