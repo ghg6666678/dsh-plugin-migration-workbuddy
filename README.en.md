@@ -2,9 +2,13 @@
 
 Migrate WorkBuddy sessions, memories, MCP drafts, and automation tasks into DSH.
 
-The plugin works out of the box and exposes a settings flow: **scan → preview → explicit confirmation
-→ import → auditable manifest**. Opening the page performs only a local **read-only** scan; it never
-copies, moves, or modifies WorkBuddy data.
+The plugin works out of the box and splits the settings page into two boards:
+
+- **Import data** (WorkBuddy → DSH): **scan → preview → explicit confirmation → import → auditable
+  manifest**. Opening the page performs only a local **read-only** scan; it never copies, moves, or
+  modifies WorkBuddy data.
+- **Export data** (DSH → WorkBuddy): appends only what is new since a per-session watermark, and
+  refuses to write until WorkBuddy has fully exited.
 
 ## Compatibility
 
@@ -28,6 +32,9 @@ Compared with v0.1.0, v0.1.1 fixes four incompatibilities with the current clien
 It also recognizes newer WorkBuddy session events (`session-meta`, `resend-fork-notice`,
 `credit-usage`) and fixes checkbox/select-all interaction on the session and automation cards.
 
+**v0.4.3** splits the settings page into "Import data" and "Export data" boards and adds the
+DSH → WorkBuddy export direction (see the export section below).
+
 ## Install
 
 The package ships a `cordis.patch.yml` and declares itself a profile bundle through
@@ -38,7 +45,7 @@ hand-written composition row needed.
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.1.1/dsh-plugin-migration-workbuddy-0.1.1.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.3/dsh-plugin-migration-workbuddy-0.4.3.tgz
 ```
 
 The tarball already contains a built `lib/`: measured at **one command, ~3 seconds, exit 0**, with no
@@ -47,7 +54,7 @@ The tarball already contains a built `lib/`: measured at **one command, ~3 secon
 ### From GitHub by tag (needs a build permission)
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.1.1
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.3
 ```
 
 A git install fetches **sources, not built artifacts**, so this package ships a `prepare` script that
@@ -84,8 +91,8 @@ dsh plugin --profile <name> add /absolute/path/to/dsh-plugin-migration-workbuddy
 ### Packing your own tarball / publishing to a registry
 
 ```bash
-pnpm pack     # produces dsh-plugin-migration-workbuddy-0.1.1.tgz (runs prepare, so it includes lib/)
-dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.1.1.tgz
+pnpm pack     # produces dsh-plugin-migration-workbuddy-0.4.3.tgz (runs prepare, so it includes lib/)
+dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.3.tgz
 
 # once published to a registry (flip package.json private to false and pick a license first)
 dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
@@ -115,6 +122,7 @@ Restart DSH and the settings page shows “Migration & backup”.
 | `maxContextTokens` | `500000` | Estimated context-token budget per imported session; older turns are dropped when exceeded (`0` = keep everything) |
 | `automationModelId` | `''` | Model id written into every migrated automation rule; empty uses the deployment default |
 | `automationModelAllowlist` | `[]` | Model ids carried over verbatim; everything else is rewritten to `automationModelId` with an `automation-model-remapped` loss |
+| `workbuddyRoot` | `''` | Export destination root; empty = `$WORKBUDDY_HOME`, else `~/.workbuddy` |
 
 The source root is `$WORKBUDDY_HOME` or `~/.workbuddy`; the target root is `$DSH_HOME` or `~/.dsh`.
 
@@ -164,6 +172,40 @@ Rules are persisted through whichever channel the deployment registers (the serv
 usable without one**: the preview still lists automation drafts but marks them ineligible, and an
 explicit automation import skips them with an `automation-channel-unavailable` loss instead of
 failing the batch. Sessions, memories, and MCP are unaffected.
+
+## Export data (DSH → WorkBuddy)
+
+The second board writes DSH sessions back into WorkBuddy — the exact opposite direction. It is built
+around one rule: **neither side's history may be lost**, so the default is append-only.
+
+- **Watermark**: every session records a `lastSyncedEventSeq` in
+  `$DSH_HOME/migration/export.json`. Only events after that seq become new JSONL rows; what was
+  already exported is never rewritten.
+- **Status** (recomputed from the transcript tail every time the board opens):
+
+  | Status | Meaning | Default action |
+  | --- | --- | --- |
+  | `new` | never exported, or the WorkBuddy transcript is gone | create a WorkBuddy session |
+  | `ahead` | DSH moved on, WorkBuddy did not | append to the original |
+  | `synced` | watermark caught up | skip |
+  | `workbuddy-ahead` | only WorkBuddy moved on | **write nothing**; point at "Import data" |
+  | `conflict` | both sides moved on | create a new WorkBuddy session, keeping both |
+
+  `workbuddy-ahead` is a separate state on purpose: appending there would misplace WorkBuddy's own
+  continuation, while creating a session would fork the history on the WorkBuddy side. Pulling the
+  new part back through the import board is the only lossless option.
+- **WorkBuddy must be fully quit**: before writing, the plugin enumerates `\\.\pipe\*` for
+  `workbuddy|codebuddy` named pipes (the only reliable liveness signal on this machine — `-wal` mtime
+  and `CreateFileW` share probes both produced false results in testing) and requires the user to
+  tick "all conversations finished, WorkBuddy fully quit". If the probe itself cannot run, export
+  **fails closed**; there is no "skip the check" escape hatch.
+- **Writes**: `workbuddy.db` is backed up first, then files go through temp-file + atomic replace.
+  JSONL rows are chained by `parentId` with strictly increasing timestamps, so a session that sat
+  idle never emits a row that sorts before its parent. Session-mode exports also upsert
+  `workspaces.path`, without which the new transcript never appears in WorkBuddy's sidebar.
+- **Undo**: each export records a batch (row offsets, DB effects, created session ids). "Undo the last
+  export" truncates the appended rows and reclaims created sessions. Truncation keeps the watermark,
+  so the next export appends that stretch again.
 
 ## Security boundaries
 

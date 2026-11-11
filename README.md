@@ -2,8 +2,11 @@
 
 把 WorkBuddy 的会话、记忆、MCP 配置与自动化任务迁移进 DSH。
 
-插件开箱可用，在设置页提供 **扫描 → 预览 → 明确确认 → 导入 → 审计清单** 的完整闭环；
-打开页面只做本机**只读**扫描，不会复制、移动或修改任何 WorkBuddy 数据。
+插件开箱可用，设置页分成两个板块：
+
+- **导入数据**（WorkBuddy → DSH）：**扫描 → 预览 → 明确确认 → 导入 → 审计清单** 的完整闭环，
+  打开页面只做本机**只读**扫描，不会复制、移动或修改任何 WorkBuddy 数据。
+- **导出数据**（DSH → WorkBuddy）：按水位线只追加新增内容，写入前要求完全退出 WorkBuddy。
 
 ## 兼容性
 
@@ -23,6 +26,9 @@
 另外补上了新版 WorkBuddy 会话事件的识别（`session-meta`、`resend-fork-notice`、`credit-usage`），
 并修了会话/自动化卡片勾选与「全选」的交互。
 
+**v0.4.3** 把设置页拆成「导入数据」与「导出数据」两个板块，并新增 DSH → WorkBuddy 的导出方向
+（详见下面的「导出数据」一节）。
+
 ## 安装
 
 本包自带 `cordis.patch.yml`，并通过 `dsh.bundle.patch` 声明自己是 profile bundle：`dsh plugin add`
@@ -32,7 +38,7 @@
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.1.1/dsh-plugin-migration-workbuddy-0.1.1.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.3/dsh-plugin-migration-workbuddy-0.4.3.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -41,7 +47,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.1.1
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.3
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从
@@ -78,8 +84,8 @@ dsh plugin --profile <name> add /绝对路径/dsh-plugin-migration-workbuddy
 ### 自己打 tarball / 发布到 registry
 
 ```bash
-pnpm pack     # 产出 dsh-plugin-migration-workbuddy-0.1.1.tgz（会自动跑 prepare，含 lib/）
-dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.1.1.tgz
+pnpm pack     # 产出 dsh-plugin-migration-workbuddy-0.4.3.tgz（会自动跑 prepare，含 lib/）
+dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.3.tgz
 
 # 发布到 registry 之后（需先把 package.json 的 private 改为 false 并定许可证）
 dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
@@ -107,6 +113,7 @@ dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
 | `maxContextTokens` | `500000` | 单个导入会话的上下文预算（估算 token）；超出时从最早的 turn 开始丢弃，只保留最近轮次；`0` = 不裁剪。也可在设置页调整 |
 | `automationModelId` | `''` | 迁移的自动化规则写死的模型 id；空 = 用部署默认模型 |
 | `automationModelAllowlist` | `[]` | 允许原样透传的模型 id；其余按 `automationModelId` 改写并记 `automation-model-remapped` |
+| `workbuddyRoot` | `''` | 导出目标根目录；空 = 用 `$WORKBUDDY_HOME`，否则 `~/.workbuddy` |
 
 源目录取 `$WORKBUDDY_HOME`，否则 `~/.workbuddy`；目标取 `$DSH_HOME`，否则 `~/.dsh`。
 
@@ -144,6 +151,35 @@ dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
 规则落库通过部署注册的通道完成（服务名 `automationImport`；部分部署还会注册一个兼容通道名）。
 **没有通道也能用**：预览照常列出自动化草稿，但标记为不可导入；显式导入时跳过并记
 `automation-channel-unavailable`，不会让整批迁移失败。会话、记忆、MCP 不受影响。
+
+## 导出数据（DSH → WorkBuddy）
+
+设置页的第二个板块把 DSH 会话写回 WorkBuddy，方向与上面完全相反。设计前提是**两边的历史都不许丢**，
+所以默认行为是**只追加，不覆盖**。
+
+- **水位线**：每个会话在 `$DSH_HOME/migration/export.json` 里记一条 `lastSyncedEventSeq`。
+  只有该 seq 之后的新事件会被写成新的 JSONL 行，已经导出的部分永不重写。
+- **状态判定**（每次打开面板都会重新读转录尾部）：
+
+  | 状态 | 含义 | 默认动作 |
+  | --- | --- | --- |
+  | `new` | 没导出过；或 WorkBuddy 里的转录文件已不存在 | 新建 WorkBuddy 会话 |
+  | `ahead` | DSH 有新内容，WorkBuddy 没动过 | 追加到原会话 |
+  | `synced` | 水位线追平 | 跳过 |
+  | `workbuddy-ahead` | 只在 WorkBuddy 那边继续过 | **不写**，提示用「导入数据」把新内容带回来 |
+  | `conflict` | 两边都动了 | 新建一个 WorkBuddy 会话，两边记录都留着 |
+
+  `workbuddy-ahead` 单独成一档是刻意的：此时往原会话追加会让 WorkBuddy 那段续写错位，而新建
+  会话又会在 WorkBuddy 侧留下两个分支，所以正确做法是先把 WorkBuddy 的新内容导回来。
+- **必须是完全退出的 WorkBuddy**：写入前先枚举 `\\.\pipe\*` 里匹配 `workbuddy|codebuddy` 的命名管道
+  （这是本机唯一可靠的存活信号，`-wal` mtime 与 `CreateFileW` 独占探测在实测中都会误判），
+  并要求用户在对话框里勾选「所有会话都已执行完毕，WorkBuddy 已完全退出」。探测本身跑不起来时
+  **直接中止**（fail closed），不提供「跳过检查」。
+- **写入**：先备份 `workbuddy.db`，再用临时文件 + 原子替换落盘；JSONL 行按 `parentId` 串成链，
+  时间戳严格单调递增（源端闲置过的会话不会产生排在父行之前的行）。会话模式导出会同时 upsert
+  `workspaces.path`，否则新转录不会出现在 WorkBuddy 侧边栏。
+- **撤销**：每次导出记一条批次（行偏移、DB 影响、新建的会话 id），「撤销上一次导出」按偏移截断
+  追加内容并回收新建的会话；已追加的内容被截断后水位线保留，下次导出会重新追加那段。
 
 ## 安全边界
 
