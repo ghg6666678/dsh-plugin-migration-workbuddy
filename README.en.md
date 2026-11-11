@@ -35,6 +35,8 @@ It also recognizes newer WorkBuddy session events (`session-meta`, `resend-fork-
 **v0.4.3** splits the settings page into "Import data" and "Export data" boards and adds the
 DSH → WorkBuddy export direction (see the export section below).
 
+**v0.4.4** fixes "the export board says there is nothing to export although the session clearly has new turns": the DSH 0.2.x session backends no longer expose `inspect()`, and `list()` now returns snapshots that nest the header. The export side therefore failed to read any events and every session id stringified to `"undefined"`, so all sessions rendered as empty. Reads now probe capabilities (`inspect` → `open/read` → `load`) and accept either `list()` shape.
+
 ## Install
 
 The package ships a `cordis.patch.yml` and declares itself a profile bundle through
@@ -45,7 +47,7 @@ hand-written composition row needed.
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.3/dsh-plugin-migration-workbuddy-0.4.3.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.4/dsh-plugin-migration-workbuddy-0.4.4.tgz
 ```
 
 The tarball already contains a built `lib/`: measured at **one command, ~3 seconds, exit 0**, with no
@@ -54,7 +56,7 @@ The tarball already contains a built `lib/`: measured at **one command, ~3 secon
 ### From GitHub by tag (needs a build permission)
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.3
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.4
 ```
 
 A git install fetches **sources, not built artifacts**, so this package ships a `prepare` script that
@@ -91,8 +93,8 @@ dsh plugin --profile <name> add /absolute/path/to/dsh-plugin-migration-workbuddy
 ### Packing your own tarball / publishing to a registry
 
 ```bash
-pnpm pack     # produces dsh-plugin-migration-workbuddy-0.4.3.tgz (runs prepare, so it includes lib/)
-dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.3.tgz
+pnpm pack     # produces dsh-plugin-migration-workbuddy-0.4.4.tgz (runs prepare, so it includes lib/)
+dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.4.tgz
 
 # once published to a registry (flip package.json private to false and pick a license first)
 dsh plugin --profile <name> add dsh-plugin-migration-workbuddy

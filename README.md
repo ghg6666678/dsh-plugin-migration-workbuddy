@@ -29,6 +29,11 @@
 **v0.4.3** 把设置页拆成「导入数据」与「导出数据」两个板块，并新增 DSH → WorkBuddy 的导出方向
 （详见下面的「导出数据」一节）。
 
+**v0.4.4** 修掉「明明还有新对话，导出板块却说没有需要导出的内容」：DSH 0.2.x 的会话后端不再提供
+`inspect()`，`list()` 也改成返回带 `header` 的快照对象，导出侧读不到事件、会话 id 还变成了字符串
+`"undefined"`，于是所有会话都显示成空。现在改成按能力探测（`inspect` → `open/read` → `load`），
+并兼容两种 `list()` 返回形状。
+
 ## 安装
 
 本包自带 `cordis.patch.yml`，并通过 `dsh.bundle.patch` 声明自己是 profile bundle：`dsh plugin add`
@@ -38,7 +43,7 @@
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.3/dsh-plugin-migration-workbuddy-0.4.3.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.4/dsh-plugin-migration-workbuddy-0.4.4.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -47,7 +52,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.3
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.4
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从
@@ -84,8 +89,8 @@ dsh plugin --profile <name> add /绝对路径/dsh-plugin-migration-workbuddy
 ### 自己打 tarball / 发布到 registry
 
 ```bash
-pnpm pack     # 产出 dsh-plugin-migration-workbuddy-0.4.3.tgz（会自动跑 prepare，含 lib/）
-dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.3.tgz
+pnpm pack     # 产出 dsh-plugin-migration-workbuddy-0.4.4.tgz（会自动跑 prepare，含 lib/）
+dsh plugin --profile <name> add ./dsh-plugin-migration-workbuddy-0.4.4.tgz
 
 # 发布到 registry 之后（需先把 package.json 的 private 改为 false 并定许可证）
 dsh plugin --profile <name> add dsh-plugin-migration-workbuddy

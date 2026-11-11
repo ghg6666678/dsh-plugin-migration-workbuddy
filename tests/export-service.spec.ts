@@ -185,6 +185,49 @@ describe('export preview', () => {
     const preview = await service.preview()
     expect(preview.sessions[0]).toMatchObject({ status: 'failed', detail: 'corrupt log' })
   })
+
+  // DSH 0.2.x backends dropped `inspect()` and return snapshots from `list()`.
+  // Reading through `open(id, 'read')` is the only path that works there, and a
+  // snapshot-shaped `list()` must still yield real session ids instead of the
+  // literal string "undefined".
+  it('reads sessions through the 0.2.x open/read API and snapshot-shaped list()', async () => {
+    const sessions = sessionsFixture()
+    const runtime = {
+      list: async () => sessions.map(item => ({ header: item.header, revision: 'rev', sizeBytes: 1 })),
+      open: async (id: unknown) => {
+        const found = sessions.find(item => String(item.header.id) === String(id))
+        if (found === undefined) throw new Error('not found')
+        return {
+          header: found.header,
+          read: async () => ({ events: found.events }),
+          close: async () => undefined,
+        }
+      },
+    } as unknown as SessionPersistence
+    const service = new ExportService(runtime, {
+      root: mkdtempSync(join(tmpdir(), 'mwb-export-root-')),
+      dshHome: mkdtempSync(join(tmpdir(), 'mwb-export-home-')),
+      activity: () => IDLE,
+      openDatabase: () => fakeDatabase(),
+    })
+    const preview = await service.preview()
+    expect(preview.summary.failed).toBe(0)
+    // Real ids, never the stringified absence of one.
+    expect(preview.sessions.map(item => item.id)).not.toContain('undefined')
+    expect(preview.sessions.length).toBe(sessions.length)
+    expect(preview.sessions.every(item => item.eventCount > 0)).toBe(true)
+  })
+
+  it('fails loudly when the backend exposes no readable API at all', async () => {
+    const opaque = { list: async () => [] } as unknown as SessionPersistence
+    const service = new ExportService(opaque, {
+      root: mkdtempSync(join(tmpdir(), 'mwb-export-root-')),
+      dshHome: mkdtempSync(join(tmpdir(), 'mwb-export-home-')),
+      activity: () => IDLE,
+      openDatabase: () => fakeDatabase(),
+    })
+    await expect(service.preview()).resolves.toMatchObject({ sessions: [] })
+  })
 })
 
 describe('export run', () => {

@@ -34,6 +34,76 @@ import { WORKBUDDY_EXPORT_FORMAT_VERSION } from './model.js'
 import { detectWorkBuddy, workBuddyRoot, type WorkBuddyActivity } from './workbuddy-process.js'
 
 /**
+ * Read one session's events across persistence generations.
+ *
+ * `inspect()` exists in the published 0.1.x contract but is gone from the
+ * 0.2.x backends that DSH actually mounts: those expose `open(id, 'read')`
+ * returning a handle whose `read(from, to)` yields `{ events }`. Reading
+ * through the handle is also the more honest path — it observes the committed
+ * log only, so a torn tail is never mistaken for exported content.
+ */
+async function readSessionEvents(
+  persistence: SessionPersistence,
+  id: SessionHeader['id'],
+): Promise<SessionEvent[]> {
+  const api = persistence as unknown as {
+    inspect?(id: SessionHeader['id']): Promise<{ events?: SessionEvent[] }>
+    open?(id: SessionHeader['id'], access: 'read'): Promise<{
+      read(from?: number, to?: number): Promise<{ events?: SessionEvent[] }>
+      close?(): Promise<void>
+    }>
+    load?(id: SessionHeader['id']): Promise<{ events?: SessionEvent[] }>
+  }
+
+  if (typeof api.inspect === 'function') {
+    const inspection = await api.inspect(id)
+    return inspection.events ?? []
+  }
+
+  if (typeof api.open === 'function') {
+    const handle = await api.open(id, 'read')
+    try {
+      const read = await handle.read(0, undefined)
+      return read.events ?? []
+    } finally {
+      await handle.close?.()
+    }
+  }
+
+  if (typeof api.load === 'function') {
+    const loaded = await api.load(id)
+    return loaded.events ?? []
+  }
+
+  throw new Error('sessionPersistence 不提供可用的读取接口（inspect/open/load 均不存在）')
+}
+
+/**
+ * List the root sessions of this profile across persistence API generations.
+ *
+ * The 0.1.x contract returned bare {@link SessionHeader}s. The 0.2.x backends
+ * DSH mounts return {@link SessionPersistenceSnapshot}s — `{ header, revision,
+ * location, ... }` — and keep the header nested. Accepting both shapes keeps
+ * one code path for either backend; a header without an `id` would otherwise
+ * silently become the literal string `"undefined"` in the UI.
+ */
+async function listSessionHeaders(persistence: SessionPersistence): Promise<SessionHeader[]> {
+  const api = persistence as unknown as {
+    list(): Promise<readonly unknown[]>
+  }
+  const listed = await api.list()
+  const headers: SessionHeader[] = []
+  for (const item of listed) {
+    const record = item as { header?: SessionHeader; id?: SessionHeader['id'] } & Partial<SessionHeader>
+    const header = record.header ?? (record as SessionHeader)
+    if (header === undefined || header.id === undefined || header.id === null) continue
+    if (header.parentSession !== undefined) continue
+    headers.push(header)
+  }
+  return headers
+}
+
+/**
  * DSH -> WorkBuddy export.
  *
  * Import is batch-shaped: it reads a finished WorkBuddy transcript and writes a
@@ -613,12 +683,12 @@ export class ExportService {
     }
     const journal = this.state()
     const mappings = this.importMappings()
-    const headers = (await this.persistence.list()).filter(header => header.parentSession === undefined)
+    const headers = await listSessionHeaders(this.persistence)
     const plans: Plan[] = []
     for (const header of headers) {
       try {
-        const inspection = await this.persistence.inspect(header.id)
-        plans.push(this.plan(header, inspection.events, journal, mappings))
+        const events = await readSessionEvents(this.persistence, header.id)
+        plans.push(this.plan(header, events, journal, mappings))
       } catch (cause) {
         plans.push({
           summary: {
