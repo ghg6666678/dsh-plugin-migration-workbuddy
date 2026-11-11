@@ -3,7 +3,8 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { Config, normalizeMigrationConfig } from './config.js'
-import { registerMigrationRoutes } from './routes.js'
+import { ExportService } from './export-service.js'
+import { registerExportRoutes, registerMigrationRoutes } from './routes.js'
 import { MigrationService } from './service.js'
 
 export const name = 'migration-workbuddy'
@@ -45,12 +46,25 @@ export function apply(ctx: Context, rawConfig: Partial<ReturnType<typeof normali
     () => registerMigrationRoutes(ctx.webServer, config, service),
     'dsh-plugin-migration-workbuddy: migration routes',
   )
-  ctx.logger.info('dsh-plugin-migration-workbuddy: WorkBuddy migration preview and import enabled')
+  // The DSH -> WorkBuddy direction is a separate service: it writes into
+  // another application's data directory, keeps its own journal, and refuses to
+  // run while WorkBuddy is alive.
+  const exporter = new ExportService(ctx.sessionPersistence, {
+    ...(config.workbuddyRoot === '' ? {} : { root: config.workbuddyRoot }),
+  })
+  ctx.effect(
+    () => registerExportRoutes(ctx.webServer, exporter),
+    'dsh-plugin-migration-workbuddy: export routes',
+  )
+  ctx.logger.info('dsh-plugin-migration-workbuddy: WorkBuddy import and export enabled')
 }
 
 export * from './model.js'
 export * from './probe.js'
 export * from './converter.js'
+export * from './exporter.js'
+export * from './export-service.js'
+export * from './workbuddy-process.js'
 export * from './memory.js'
 export * from './mcp.js'
 export * from './service.js'

@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebServer } from '@deepseek-ai/dsh-host-webserver'
 import type { MigrationConfig } from './config.js'
+import { ExportBlockedError, type ExportService } from './export-service.js'
 import { MigrationService, sanitizePathForPreview, sanitizeSessionFilter } from './service.js'
 
 export const MIGRATION_PROBE_PATH = '/api/migration/workbuddy/probe'
@@ -11,6 +12,12 @@ export const MIGRATION_SETTINGS_PATH = '/api/migration/workbuddy/settings'
 export const MIGRATION_ARCHIVE_PATH = '/api/migration/workbuddy/archive'
 export const MIGRATION_MEMORY_UPDATE_PATH = '/api/migration/workbuddy/memory/update'
 export const MIGRATION_MEMORY_DELETE_PATH = '/api/migration/workbuddy/memory/delete'
+
+/** DSH -> WorkBuddy direction. */
+export const MIGRATION_EXPORT_PREVIEW_PATH = '/api/migration/workbuddy/export/preview'
+export const MIGRATION_EXPORT_RUN_PATH = '/api/migration/workbuddy/export/run'
+export const MIGRATION_EXPORT_UNDO_PATH = '/api/migration/workbuddy/export/undo'
+export const MIGRATION_EXPORT_HISTORY_PATH = '/api/migration/workbuddy/export/history'
 
 /** Sent by the bundled client on every call; keep in sync with src/client/api.ts. */
 export const MIGRATION_CLIENT_HEADER = 'x-workbuddy-migration'
@@ -122,6 +129,17 @@ function redactManifest(value: Awaited<ReturnType<MigrationService['manifestView
   }
 }
 
+function redactExportPreview(value: Awaited<ReturnType<ExportService['preview']>>): Awaited<ReturnType<ExportService['preview']>> {
+  return {
+    ...value,
+    workbuddyRoot: sanitizePathForPreview(value.workbuddyRoot),
+    sessions: value.sessions.map(item => ({
+      ...item,
+      transcriptPath: item.transcriptPath === '' ? '' : sanitizePathForPreview(item.transcriptPath),
+    })),
+  }
+}
+
 export function registerMigrationRoutes(webserver: WebServer, config: MigrationConfig, service: MigrationService): () => void {
   const paths = [MIGRATION_PROBE_PATH, MIGRATION_PREVIEW_PATH, MIGRATION_RUN_PATH, MIGRATION_MANIFEST_PATH, MIGRATION_ARCHIVE_PATH, MIGRATION_MEMORY_UPDATE_PATH, MIGRATION_MEMORY_DELETE_PATH]
   const routes = paths.map(path => webserver.register({
@@ -203,4 +221,77 @@ export function registerMigrationRoutes(webserver: WebServer, config: MigrationC
   }))
   void config
   return () => { routes.forEach(dispose => dispose()) }
+}
+
+/**
+ * DSH -> WorkBuddy routes.
+ *
+ * Kept separate from the import routes because they carry a different risk: the
+ * import direction only creates DSH sessions, while these write into another
+ * application's live data directory. Every mutating call therefore requires the
+ * same-origin marker plus an explicit `exitConfirmed` acknowledgement, and a
+ * blocked write answers 409 (not 500) so the client can show the quit
+ * instructions instead of a generic failure.
+ */
+export function registerExportRoutes(webserver: WebServer, exporter: ExportService): () => void {
+  const paths = [
+    MIGRATION_EXPORT_PREVIEW_PATH,
+    MIGRATION_EXPORT_RUN_PATH,
+    MIGRATION_EXPORT_UNDO_PATH,
+    MIGRATION_EXPORT_HISTORY_PATH,
+  ]
+  const routes = paths.map(path => webserver.register({
+    kind: 'exact' as const,
+    path,
+    handler: async (req, res) => {
+      const mutating = path === MIGRATION_EXPORT_RUN_PATH || path === MIGRATION_EXPORT_UNDO_PATH
+      if (!sameOrigin(req, mutating, webserver.port)) { sendJson(res, 403, { error: 'loopback same-origin request required' }); return }
+      try {
+        if (path === MIGRATION_EXPORT_PREVIEW_PATH) {
+          if (req.method !== 'GET' && req.method !== 'POST') { sendJson(res, 405, { error: 'GET or POST required' }); return }
+          const refresh = req.method === 'POST' ? (await body(req)).refresh === true : url(req).searchParams.get('refresh') === '1'
+          sendJson(res, 200, redactExportPreview(await exporter.preview({ refresh })))
+          return
+        }
+        if (path === MIGRATION_EXPORT_HISTORY_PATH) {
+          if (req.method !== 'GET') { sendJson(res, 405, { error: 'GET required' }); return }
+          sendJson(res, 200, { batches: exporter.history() })
+          return
+        }
+        if (path === MIGRATION_EXPORT_RUN_PATH) {
+          if (req.method !== 'POST') { sendJson(res, 405, { error: 'POST required' }); return }
+          const input = await body(req)
+          if (input.confirmed !== true) { sendJson(res, 400, { error: 'explicit confirmation required' }); return }
+          if (input.exitConfirmed !== true) { sendJson(res, 400, { error: 'exitConfirmed required: quit WorkBuddy before exporting' }); return }
+          let sessionIds: string[] | undefined
+          try {
+            sessionIds = sanitizeSessionFilter(input.sessionIds, 'sessionIds')
+          } catch (cause) {
+            sendJson(res, 400, { error: cause instanceof Error ? cause.message : String(cause) }); return
+          }
+          sendJson(res, 200, await exporter.run({
+            ...(sessionIds.length > 0 ? { sessionIds } : {}),
+            ...(input.mode === 'new-session' ? { mode: 'new-session' as const } : {}),
+            exitConfirmed: true,
+            ...(input.refresh === true ? { refresh: true } : {}),
+          }))
+          return
+        }
+        if (req.method !== 'POST') { sendJson(res, 405, { error: 'POST required' }); return }
+        const input = await body(req)
+        sendJson(res, 200, await exporter.undo(typeof input.batchId === 'string' ? input.batchId : undefined))
+      } catch (cause) {
+        if (cause instanceof ExportBlockedError) {
+          sendJson(res, 409, { error: cause.message, activity: cause.activity })
+          return
+        }
+        sendJson(res, 500, { error: cause instanceof Error ? cause.message : String(cause) })
+      }
+    },
+  }))
+  return () => { routes.forEach(dispose => dispose()) }
+}
+
+function url(req: IncomingMessage): URL {
+  return new URL(req.url ?? '/', 'http://127.0.0.1')
 }

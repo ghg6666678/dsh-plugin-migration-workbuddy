@@ -207,3 +207,103 @@ export interface MigrationResult {
   loss: LossRecord[]
   errors: Array<{ sourcePath: string; message: string }>
 }
+
+/** Format version of the DSH -> WorkBuddy journal written by the exporter. */
+export const WORKBUDDY_EXPORT_FORMAT_VERSION = 1
+
+/**
+ * How one DSH session relates to its WorkBuddy transcript.
+ *
+ * - `new`: nothing has been exported yet; a new WorkBuddy session is created.
+ * - `ahead`: DSH holds events the transcript does not; they are appended.
+ * - `synced`: both sides are at the same event; nothing to write.
+ * - `workbuddy-ahead`: only WorkBuddy moved on. Exporting would be a no-op, so
+ *   the user is told to import that session back instead.
+ * - `conflict`: both sides moved on independently. Appending would interleave
+ *   two histories, so a new WorkBuddy session carries the DSH side.
+ * - `empty`: the session has no exportable event (e.g. only a seed).
+ * - `failed`: the session log could not be read.
+ */
+export type ExportSessionStatus = 'new' | 'ahead' | 'synced' | 'workbuddy-ahead' | 'conflict' | 'empty' | 'failed'
+
+export interface ExportSessionSummary {
+  /** DSH session id. */
+  id: string
+  title?: string
+  createdAt: number
+  /** WorkBuddy-formatted working directory. */
+  cwd?: string
+  eventCount: number
+  /** First DSH event sequence this export would consider. */
+  startSeq: number
+  /** Highest event sequence already present in WorkBuddy. */
+  lastSyncedEventSeq: number
+  /** Events that would be written by the next export. */
+  pendingEvents: number
+  /** WorkBuddy rows that would be written by the next export. */
+  pendingRows: number
+  status: ExportSessionStatus
+  /** Target WorkBuddy session id, or a placeholder when none exists yet. */
+  workbuddySessionId: string
+  transcriptPath: string
+  lastSyncedAt?: string
+  /** Explanation shown next to a conflict or an unavailable target. */
+  detail?: string
+}
+
+export interface ExportPreview {
+  exportFormatVersion: number
+  generatedAt: string
+  /** WorkBuddy data directory the export writes into. */
+  workbuddyRoot: string
+  /** Whether WorkBuddy is still running, which blocks every write. */
+  activity: {
+    running: boolean
+    observed: boolean
+    evidence: string[]
+    checkedAt: string
+  }
+  sessions: ExportSessionSummary[]
+  summary: {
+    total: number
+    new: number
+    ahead: number
+    synced: number
+    /** Sessions that only moved on in WorkBuddy; import them back instead. */
+    workbuddyAhead: number
+    conflict: number
+    empty: number
+    failed: number
+    pendingRows: number
+    lastExportedAt?: string
+    lastSyncedSessions: number
+  }
+}
+
+export interface ExportResult {
+  exportFormatVersion: number
+  finishedAt: string
+  exportedSessions: number
+  skippedSessions: number
+  /** Sessions written as brand-new WorkBuddy conversations. */
+  createdSessions: number
+  /** Sessions appended to the transcript they came from. */
+  appendedSessions: number
+  /** WorkBuddy rows written in total. */
+  rows: number
+  sessions: Array<{
+    sessionId: string
+    workbuddySessionId: string
+    /** Where the rows landed; the panel links to it so the user can check. */
+    transcriptPath: string
+    rows: number
+    lastEventSeq: number
+    created: boolean
+  }>
+  errors: Array<{ sessionId: string; message: string }>
+  /**
+   * Sessions whose newer content exists only in WorkBuddy. Exporting cannot
+   * bring it across, so the result points the user at the import direction.
+   */
+  pendingImport: Array<{ sessionId: string; title?: string }>
+}

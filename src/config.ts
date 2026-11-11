@@ -25,6 +25,11 @@ export interface MigrationConfig {
    * replaced by `automationModelId` or the deployment default.
    */
   automationModelAllowlist: string[]
+  /**
+   * WorkBuddy data directory used by export. Empty (default) means
+   * `$WORKBUDDY_HOME`, then `~/.workbuddy`.
+   */
+  workbuddyRoot: string
 }
 
 export const Config: z<MigrationConfig> = z.object({
@@ -35,6 +40,7 @@ export const Config: z<MigrationConfig> = z.object({
   toolMode: (z.union(['transcript', 'narrative'] as const)).default('transcript'),
   automationModelId: z.string().default(''),
   automationModelAllowlist: z.array(z.string()).default([]),
+  workbuddyRoot: z.string().default(''),
 })
 
 export function normalizeMigrationConfig(raw: Partial<MigrationConfig> | undefined): MigrationConfig {
@@ -48,5 +54,6 @@ export function normalizeMigrationConfig(raw: Partial<MigrationConfig> | undefin
     automationModelAllowlist: (raw?.automationModelAllowlist ?? [])
       .map(item => item.trim())
       .filter(item => item.length > 0),
+    workbuddyRoot: raw?.workbuddyRoot?.trim() ?? '',
   }
 }
