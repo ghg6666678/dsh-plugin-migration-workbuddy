@@ -15,8 +15,11 @@ import { parseWorkBuddyInput } from './input-envelope.js'
  * count) so the runtime never replays imported history into the live surface.
  * v8: toolMode 'narrative' flattens tool calls/results into plain text so the
  * imported history carries no tool-output protocol (continuation always valid).
+ * v9: group rows into real turns and steps — one user request is one turn and
+ * every assistant round is one step carrying its tool calls and results —
+ * instead of emitting one turn per WorkBuddy row.
  */
-export const MIGRATION_CONVERTER_VERSION = 8
+export const MIGRATION_CONVERTER_VERSION = 9
 
 export type ToolMode = 'transcript' | 'narrative'
 
@@ -154,15 +157,148 @@ export function normalizeAssistantSettlements(events: SessionEvent[]): SessionEv
   return events
 }
 
-function pushTurn(events: SessionEvent[], turn: number, time: number, append: (seq: number, step: number) => SessionEvent[], seq: number): number {
-  events.push(event('turn/start', { turn }, seq++, time))
-  // DSH turn/step numbers are one-based. A zero turn is accepted by TypeScript
-  // casts but rejected when the persisted session is reloaded.
-  events.push(event('step/start', { turn, step: 1 }, seq++, time))
-  for (const item of append(seq, 1)) { events.push(item); seq += 1 }
-  events.push(event('step/end', { turn, step: 1 }, seq++, time))
-  events.push(event('turn/end', { turn, reason: { kind: 'completed' } }, seq++, time))
-  return seq
+type PendingCall = { callId: string; name: string; arguments: string }
+type UserMessageLike = ReturnType<typeof createUserMessage>
+type ToolResultLike = ReturnType<typeof createToolResultMessage>
+
+/**
+ * Group WorkBuddy rows into DSH's real conversation shape.
+ *
+ * One user request is one DSH turn. Inside it, every assistant round is a
+ * step: the assistant message (text/reasoning/tool-call blocks), its
+ * `tool/call` events, and the matching `tool/result` events. Parallel calls
+ * share a step; a new assistant round after results opens the next step.
+ * Streaming rows as one turn each — the old behaviour — made every tool call
+ * and every result look like a separate conversation.
+ */
+class TurnAssembler {
+  readonly events: SessionEvent[] = []
+  private seq = 0
+  private turn = 0
+  private step = 0
+  private turnOpen = false
+  private stepOpen = false
+  private stepHasResults = false
+  private bufferedBlocks: ContentBlock[] = []
+  private bufferedCalls: PendingCall[] = []
+  private readonly outstanding = new Map<string, PendingCall>()
+
+  /** A call this assembler emitted or buffered, waiting for its result. */
+  knownCall(callId: string): PendingCall | undefined {
+    return this.outstanding.get(callId)
+  }
+
+  /** Calls still waiting for a result at end of input. */
+  outstandingCount(): number {
+    return this.outstanding.size
+  }
+
+  private event<T extends SessionEvent['type']>(type: T, data: SessionEvent<T>['data'], time: number): void {
+    this.events.push({ type, data, seq: SessionSeq(this.seq), time } as unknown as SessionEvent)
+    this.seq += 1
+  }
+
+  private surface<T extends 'user/message' | 'assistant/message' | 'tool/result'>(type: T, data: SessionEvent<T>['data'], time: number): void {
+    this.events.push(surfaceEvent(type, data, this.seq, time))
+    this.seq += 1
+  }
+
+  private startTurn(time: number): void {
+    this.turn += 1
+    this.step = 0
+    this.turnOpen = true
+    this.event('turn/start', { turn: this.turn }, time)
+  }
+
+  private ensureStep(time: number): void {
+    if (!this.turnOpen) this.startTurn(time)
+    if (this.stepOpen) return
+    this.step += 1
+    this.stepOpen = true
+    this.stepHasResults = false
+    this.event('step/start', { turn: this.turn, step: this.step }, time)
+  }
+
+  /** Emit the buffered assistant message and its tool calls in the current step. */
+  private flush(time: number): void {
+    if (this.bufferedBlocks.length === 0 && this.bufferedCalls.length === 0) return
+    this.ensureStep(time)
+    if (this.bufferedBlocks.length > 0) {
+      const message = createAssistantMessage({ content: this.bufferedBlocks, source: { provider: 'workbuddy', model: 'imported' } })
+      this.surface('assistant/message', { turn: this.turn, step: this.step, message }, time)
+    }
+    for (const call of this.bufferedCalls) {
+      this.event('tool/call', { turn: this.turn, step: this.step, callId: ToolCallId(call.callId), name: call.name, arguments: call.arguments }, time)
+    }
+    this.bufferedBlocks = []
+    this.bufferedCalls = []
+  }
+
+  private closeStep(time: number): void {
+    this.flush(time)
+    if (!this.stepOpen) return
+    this.event('step/end', { turn: this.turn, step: this.step }, time)
+    this.stepOpen = false
+  }
+
+  closeTurn(time: number): void {
+    this.closeStep(time)
+    if (!this.turnOpen) return
+    this.event('turn/end', { turn: this.turn, reason: { kind: 'completed' } }, time)
+    this.turnOpen = false
+  }
+
+  /** Start the next user turn, closing any open assistant round first. */
+  beginTurn(time: number): void {
+    this.closeTurn(time)
+    this.startTurn(time)
+    this.ensureStep(time)
+  }
+
+  user(message: UserMessageLike, time: number): void {
+    this.ensureStep(time)
+    this.surface('user/message', message, time)
+  }
+
+  assistant(blocks: ContentBlock[], time: number): void {
+    if (this.stepHasResults) this.closeStep(time)
+    this.ensureStep(time)
+    this.bufferedBlocks.push(...blocks)
+  }
+
+  call(call: PendingCall, time: number): void {
+    if (this.stepHasResults) this.closeStep(time)
+    this.ensureStep(time)
+    this.bufferedBlocks.push(...toolCallContent(call))
+    this.bufferedCalls.push(call)
+    this.outstanding.set(call.callId, call)
+  }
+
+  result(call: PendingCall, message: ToolResultLike, needsSyntheticCall: boolean, time: number): void {
+    this.ensureStep(time)
+    if (needsSyntheticCall) this.call(call, time)
+    this.flush(time)
+    this.surface('tool/result', { turn: this.turn, step: this.step, message }, time)
+    this.stepHasResults = true
+    this.outstanding.delete(call.callId)
+  }
+
+  /** Close every outstanding call with an explicit error result, then the turn. */
+  finish(time: number): void {
+    for (const call of [...this.outstanding.values()]) {
+      this.ensureStep(time)
+      this.flush(time)
+      const message = createToolResultMessage({
+        callId: ToolCallId(call.callId),
+        content: content('WorkBuddy 未返回工具结果；此调用仅作为历史占位。'),
+        isError: true,
+      })
+      this.surface('tool/result', { turn: this.turn, step: this.step, message }, time)
+      this.stepHasResults = true
+      this.outstanding.delete(call.callId)
+    }
+    this.closeTurn(time)
+  }
 }
 
 /** Convert one WorkBuddy JSONL file to DSH's durable event vocabulary. */
@@ -174,16 +310,13 @@ export async function convertWorkBuddySession(path: string, root: string, metada
   const parts = relative(`${root}/projects`, path).split(sep)
   const projectHash = parts[0] ?? 'unknown'
   const lines = raw.split(/\r?\n/)
-  const events: SessionEvent[] = []
+  const assembler = new TurnAssembler()
   const loss: LossRecord[] = []
-  const pendingCalls = new Map<string, { callId: string; name: string; arguments: string }>()
   // WorkBuddy can repeat the same call/result row (retries, streamed updates).
   // OpenAI-compatible gateways reject duplicate tool outputs for one call id,
   // so each callId emits at most one assistant tool-call block and one result.
   const emittedCallIds = new Set<string>()
   const resultedCallIds = new Set<string>()
-  let seq = 0
-  let turn = 0
   let title: string | undefined = metadata?.title
   let firstUserTitle: string | undefined
   let createdAt = Number.POSITIVE_INFINITY
@@ -209,45 +342,33 @@ export async function convertWorkBuddySession(path: string, root: string, metada
         const candidate = (parsedInput?.text ?? textOf(row.content)).trim()
         if (candidate) firstUserTitle = candidate.slice(0, 80)
       }
-      const currentTurn = ++turn
       if (role === 'assistant') {
-        const message = createAssistantMessage({ content: content(textOf(row.content)), source: { provider: 'workbuddy', model: 'imported' } })
-        seq = pushTurn(events, currentTurn, at, (start, step) => [surfaceEvent('assistant/message', { turn: currentTurn, step, message }, start, at)], seq)
+        assembler.assistant(content(textOf(row.content)), at)
       } else {
         const input = parsedInput!
         for (const warning of input.warnings) loss.push({ code: 'input-envelope-warning', detail: `line ${index + 1}: ${warning}` })
-        seq = pushTurn(events, currentTurn, at, (start) => {
-          const appended: SessionEvent[] = []
-          let next = start
-          if (input.contextSections.length > 0) {
-            const contextMessage = createUserMessage({
-              content: content(input.contextSections.map(section => `${section.name}:\n${section.text}`).join('\n\n')),
-              source: { kind: 'plugin', plugin: 'WorkBuddy 上下文', form: 'snapshot', sections: input.contextSections },
-            })
-            appended.push(surfaceEvent('user/message', contextMessage, next, at))
-            next += 1
-          }
-          if (input.text !== '' || !input.hadContext) {
-            const message = createUserMessage({ content: content(input.text), source: { kind: 'user' } })
-            appended.push(surfaceEvent('user/message', message, next, at))
-          } else {
-            loss.push({ code: 'context-only-message', detail: `line ${index + 1}: no user_query was present` })
-          }
-          return appended
-        }, seq)
+        assembler.beginTurn(at)
+        if (input.contextSections.length > 0) {
+          const contextMessage = createUserMessage({
+            content: content(input.contextSections.map(section => `${section.name}:\n${section.text}`).join('\n\n')),
+            source: { kind: 'plugin', plugin: 'WorkBuddy 上下文', form: 'snapshot', sections: input.contextSections },
+          })
+          assembler.user(contextMessage, at)
+        }
+        if (input.text !== '' || !input.hadContext) {
+          assembler.user(createUserMessage({ content: content(input.text), source: { kind: 'user' } }), at)
+        } else {
+          loss.push({ code: 'context-only-message', detail: `line ${index + 1}: no user_query was present` })
+        }
       }
     } else if (kind === 'reasoning') {
-      const message = createAssistantMessage({ content: content(textOf(row.rawContent ?? row.content), true), source: { provider: 'workbuddy', model: 'imported' } })
-      const currentTurn = ++turn
-      seq = pushTurn(events, currentTurn, at, (start, step) => [surfaceEvent('assistant/message', { turn: currentTurn, step, message }, start, at)], seq)
+      assembler.assistant(content(textOf(row.rawContent ?? row.content), true), at)
     } else if (kind === 'function_call') {
       const callId = sourceId(row.callId ?? row.id, `workbuddy-call-${index}`)
+      const callName = sourceId(row.name, 'unknown-tool')
+      const callArguments = argumentsOf(row.arguments)
       if (toolMode === 'narrative') {
-        const callName = sourceId(row.name, 'unknown-tool')
-        const callArgs = argumentsOf(row.arguments)
-        const currentTurn = ++turn
-        const message = createAssistantMessage({ content: content(`【工具调用 ${callName}】${callArgs}`), source: { provider: 'workbuddy', model: 'imported' } })
-        seq = pushTurn(events, currentTurn, at, (start, step) => [surfaceEvent('assistant/message', { turn: currentTurn, step, message }, start, at)], seq)
+        assembler.assistant(content(`【工具调用 ${callName}】${callArguments}`), at)
         loss.push({ code: 'tool-flattened', detail: `line ${index + 1} (${callId})` })
         continue
       }
@@ -255,28 +376,14 @@ export async function convertWorkBuddySession(path: string, root: string, metada
         loss.push({ code: 'duplicate-tool-call', detail: `line ${index + 1} (${callId})` })
         continue
       }
-      const call = { callId, name: sourceId(row.name, 'unknown-tool'), arguments: argumentsOf(row.arguments) }
-      pendingCalls.set(callId, call)
-      const currentTurn = ++turn
-      seq = pushTurn(events, currentTurn, at, (start, step) => {
-        const message = createAssistantMessage({
-          content: toolCallContent(call),
-          source: { provider: 'workbuddy', model: 'imported' },
-        })
-        return [
-          surfaceEvent('assistant/message', { turn: currentTurn, step, message }, start, at),
-          event('tool/call', { turn: currentTurn, step, callId: ToolCallId(callId), name: call.name, arguments: call.arguments }, start + 1, at),
-        ]
-      }, seq)
+      assembler.call({ callId, name: callName, arguments: callArguments }, at)
       emittedCallIds.add(callId)
     } else if (kind === 'function_call_result') {
       const callId = sourceId(row.callId ?? row.id, `workbuddy-call-${index}`)
+      const isError = row.status === 'error' || row.isError === true
       if (toolMode === 'narrative') {
         const outputText = textOf(row.output ?? row.content)
-        const isError = row.status === 'error' || row.isError === true
-        const currentTurn = ++turn
-        const message = createUserMessage({ content: content(`【工具结果${isError ? '（错误）' : ''}】${outputText}`), source: { kind: 'user' } })
-        seq = pushTurn(events, currentTurn, at, (start) => [surfaceEvent('user/message', message, start, at)], seq)
+        assembler.assistant(content(`【工具结果${isError ? '（错误）' : ''}】${outputText}`), at)
         loss.push({ code: 'tool-result-flattened', detail: `line ${index + 1} (${callId})` })
         continue
       }
@@ -284,57 +391,22 @@ export async function convertWorkBuddySession(path: string, root: string, metada
         loss.push({ code: 'duplicate-tool-result', detail: `line ${index + 1} (${callId})` })
         continue
       }
-      let call = pendingCalls.get(callId)
-      const orphan = call === undefined
-      if (orphan) {
-        loss.push({ code: 'orphan-tool-result', detail: `line ${index + 1} (${callId})` })
-        // Keep an orphan result usable by the next model request. OpenAI-style
-        // gateways reject a tool output whose call id never appeared in an
-        // assistant tool-call message, so create a conservative synthetic call.
-        call = {
-          callId,
-          name: sourceId(row.name, 'unknown-tool'),
-          arguments: argumentsOf(row.arguments),
-        }
-      }
-      const message = createToolResultMessage({ callId: ToolCallId(callId), content: content(textOf(row.output ?? row.content)), isError: row.status === 'error' || row.isError === true })
-      const currentTurn = ++turn
-      seq = pushTurn(events, currentTurn, at, (start, step) => {
-        const appended: SessionEvent[] = []
-        let next = start
-        if (orphan) {
-          const assistant = createAssistantMessage({
-            content: toolCallContent(call!),
-            source: { provider: 'workbuddy', model: 'imported' },
-          })
-          appended.push(surfaceEvent('assistant/message', { turn: currentTurn, step, message: assistant }, next, at))
-          next += 1
-        }
-        appended.push(surfaceEvent('tool/result', { turn: currentTurn, step, message }, next, at))
-        return appended
-      }, seq)
-      pendingCalls.delete(callId)
+      const known = assembler.knownCall(callId)
+      const orphan = known === undefined
+      if (orphan) loss.push({ code: 'orphan-tool-result', detail: `line ${index + 1} (${callId})` })
+      const call = known ?? { callId, name: sourceId(row.name, 'unknown-tool'), arguments: argumentsOf(row.arguments) }
+      const resultMessage = createToolResultMessage({ callId: ToolCallId(callId), content: content(textOf(row.output ?? row.content)), isError })
+      assembler.result(call, resultMessage, orphan, at)
       resultedCallIds.add(callId)
       if (orphan) emittedCallIds.add(callId)
     } else if (kind === 'file-history-snapshot') loss.push({ code: 'file-history', detail: 'file history snapshots are not imported' })
     else loss.push({ code: 'unknown-event', detail: `${kind} at line ${index + 1}` })
   }
-  if (pendingCalls.size > 0) {
-    loss.push({ code: 'unpaired-tool-call', detail: `${String(pendingCalls.size)} tool call(s) have no result` })
-    // Close every dangling assistant tool call with an explicit error result.
-    // This keeps imported history valid for a subsequent user turn while the
-    // loss record makes the source truncation visible in the audit report.
-    for (const call of pendingCalls.values()) {
-      const currentTurn = ++turn
-      const at = Number.isFinite(createdAt) ? createdAt : Date.now()
-      const message = createToolResultMessage({
-        callId: ToolCallId(call.callId),
-        content: content('WorkBuddy 未返回工具结果；此调用仅作为历史占位。'),
-        isError: true,
-      })
-      seq = pushTurn(events, currentTurn, at, (start, step) => [surfaceEvent('tool/result', { turn: currentTurn, step, message }, start, at)], seq)
-    }
+  if (assembler.outstandingCount() > 0) {
+    loss.push({ code: 'unpaired-tool-call', detail: `${String(assembler.outstandingCount())} tool call(s) have no result` })
   }
+  assembler.finish(Number.isFinite(createdAt) ? createdAt : Date.now())
+  const events = assembler.events
   title ??= firstUserTitle
   // Titles are log-only metadata and must precede the seed turns. Explicit
   // user-supplied titles cite no messages, which is the invariant accepted by

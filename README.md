@@ -103,7 +103,7 @@ dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
 | `enabled` | `true` | 关闭后插件完全不扫描磁盘 |
 | `maxFileBytes` | `10485760` | 单个源文件上限（1 KiB – 100 MiB） |
 | `maxFiles` | `5000` | 单次扫描文件数上限 |
-| `toolMode` | `narrative` | `narrative` 把工具调用/结果拍平为文本，导入历史不带工具协议、可无条件续聊；`transcript` 保留完整协议 |
+| `toolMode` | `transcript` | `transcript` 保留完整工具协议：一个用户请求 = 一个 turn，每轮助手回复 = 一个 step，工具调用与结果留在同一个 step 里，DSH 能正确识别输入/输出；`narrative` 把工具调用/结果拍平为文本，导入历史不带工具协议 |
 | `automationModelId` | `''` | 迁移的自动化规则写死的模型 id；空 = 用部署默认模型 |
 | `automationModelAllowlist` | `[]` | 允许原样透传的模型 id；其余按 `automationModelId` 改写并记 `automation-model-remapped` |
 

@@ -1,5 +1,26 @@
 # 更新日志
 
+## v0.1.5 — 2026-11-11
+
+修复导入会话把「一次工具调用 + 一条工具结果」当成一轮对话的问题。
+
+WorkBuddy 的 JSONL 是逐行事件（`message` / `reasoning` / `function_call` /
+`function_call_result`），旧转换器给每一行都开一个 turn：一次用户请求会被拆成几十个 DSH
+turn，工具调用与结果也各自成为独立回合，DSH 无法识别它们属于同一次请求。
+
+现在按 DSH 的真实结构重组：
+
+- 一条用户消息 = 一个 turn；
+- 每个助手回合 = 一个 step：`assistant/message`（reasoning / text / tool-call 块）、该步的
+  `tool/call` 事件、以及对应的 `tool/result` 事件都在同一个 step；
+- 并行工具调用共享一个 step；拿到结果后的下一条助手消息进入下一个 step；
+- 没有结果的调用在收尾时补一条错误结果，孤立结果补一条合成调用。
+
+同时把默认 `toolMode` 从 `narrative` 改为 `transcript`，让 DSH 原生识别工具调用/结果
+（`narrative` 拍平为文本的能力仍保留，可显式启用）。
+
+`converterVersion` 升到 9：旧导入会在预览里显示为「修复」，重新导入即可应用新分组。
+
 ## v0.1.4 — 2026-11-11
 
 修复「在 WorkBuddy 里已经删除的对话仍然被导入」。
