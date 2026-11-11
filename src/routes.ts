@@ -7,6 +7,7 @@ export const MIGRATION_PROBE_PATH = '/api/migration/workbuddy/probe'
 export const MIGRATION_PREVIEW_PATH = '/api/migration/workbuddy/preview'
 export const MIGRATION_RUN_PATH = '/api/migration/workbuddy/run'
 export const MIGRATION_MANIFEST_PATH = '/api/migration/workbuddy/manifest'
+export const MIGRATION_SETTINGS_PATH = '/api/migration/workbuddy/settings'
 export const MIGRATION_ARCHIVE_PATH = '/api/migration/workbuddy/archive'
 export const MIGRATION_MEMORY_UPDATE_PATH = '/api/migration/workbuddy/memory/update'
 export const MIGRATION_MEMORY_DELETE_PATH = '/api/migration/workbuddy/memory/delete'
@@ -134,6 +135,17 @@ export function registerMigrationRoutes(webserver: WebServer, config: MigrationC
           if (req.method !== 'GET') { sendJson(res, 405, { error: 'GET required' }); return }
           sendJson(res, 200, path === MIGRATION_PREVIEW_PATH ? redactPreview(await service.preview()) : redactReport(await service.probe()))
           return
+        }
+        if (path === MIGRATION_SETTINGS_PATH) {
+          if (req.method === 'GET') { sendJson(res, 200, await service.settings()); return }
+          if (req.method === 'POST') {
+            const input = await body(req)
+            if (typeof input.maxFileBytes !== 'number' || !Number.isSafeInteger(input.maxFileBytes) || input.maxFileBytes < 0) {
+              sendJson(res, 400, { error: 'maxFileBytes must be a non-negative integer' }); return
+            }
+            sendJson(res, 200, await service.saveSettings({ maxFileBytes: input.maxFileBytes })); return
+          }
+          sendJson(res, 405, { error: 'GET or POST required' }); return
         }
         if (path === MIGRATION_MANIFEST_PATH) {
           if (req.method !== 'GET') { sendJson(res, 405, { error: 'GET required' }); return }

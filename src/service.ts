@@ -269,8 +269,27 @@ async function automationRuleFor(draft: AutomationDraft, workspacePath: string |
   }
 }
 
+/** User-editable migration settings; persisted under `$DSH_HOME/migration/settings.json`. */
+export interface MigrationSettings {
+  /** Per-file cap in bytes; 0 = no cap. Absent = use the deployment config. */
+  maxFileBytes?: number
+}
+
+function sanitizeSettings(value: unknown): MigrationSettings {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {}
+  const record = value as Record<string, unknown>
+  const result: MigrationSettings = {}
+  if (record.maxFileBytes !== undefined) {
+    const raw = record.maxFileBytes
+    if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) throw new Error('maxFileBytes must be a non-negative integer')
+    result.maxFileBytes = raw
+  }
+  return result
+}
+
 export class MigrationService {
   readonly manifestPath: string
+  readonly settingsPath: string
   private readonly memoryPath: string
   private manifest?: Manifest
   private running = false
@@ -282,11 +301,34 @@ export class MigrationService {
   ) {
     const root = targetRoot()
     this.manifestPath = join(root, 'migration', 'manifest.json')
+    this.settingsPath = join(root, 'migration', 'settings.json')
     this.memoryPath = join(root, 'migration', 'memory', 'records.jsonl')
   }
 
   private toolMode(): 'transcript' | 'narrative' {
     return this.options.toolMode ?? 'narrative'
+  }
+
+  /** Runtime-adjustable settings, persisted next to the migration manifest. */
+  async settings(): Promise<MigrationSettings> {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(this.settingsPath, 'utf8'))
+      return sanitizeSettings(parsed)
+    } catch {
+      return {}
+    }
+  }
+
+  async saveSettings(patch: MigrationSettings): Promise<MigrationSettings> {
+    const next: MigrationSettings = { ...await this.settings(), ...sanitizeSettings(patch) }
+    await atomicJson(this.settingsPath, next)
+    return next
+  }
+
+  /** UI settings override the deployment config; absent keeps the config value. */
+  private async effectiveMaxFileBytes(): Promise<number | undefined> {
+    const settings = await this.settings()
+    return settings.maxFileBytes ?? this.options.maxFileBytes
   }
 
   /** Migrated automations must not carry WorkBuddy model ids (unknown on the gateway). */
@@ -303,7 +345,8 @@ export class MigrationService {
   }
 
   async probe(): Promise<ProbeReport> {
-    return await probeWorkBuddy({ root: this.options.sourceRoot ?? defaultWorkBuddyRoot(), ...(this.options.maxFileBytes === undefined ? {} : { maxFileBytes: this.options.maxFileBytes }), ...(this.options.maxFiles === undefined ? {} : { maxFiles: this.options.maxFiles }) })
+    const maxFileBytes = await this.effectiveMaxFileBytes()
+    return await probeWorkBuddy({ root: this.options.sourceRoot ?? defaultWorkBuddyRoot(), ...(maxFileBytes === undefined ? {} : { maxFileBytes }), ...(this.options.maxFiles === undefined ? {} : { maxFiles: this.options.maxFiles }) })
   }
 
   async preview(): Promise<MigrationPreview> {

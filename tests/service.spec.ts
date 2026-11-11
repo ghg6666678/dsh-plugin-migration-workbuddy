@@ -198,3 +198,35 @@ describe('MigrationService deleted sessions', () => {
     }
   })
 })
+
+describe('MigrationService settings', () => {
+  it('persists the per-file limit and applies it to probing', async () => {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-settings-source-'))
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-settings-target-'))
+    const project = join(sourceRoot, 'projects', 'p')
+    await mkdir(project, { recursive: true })
+    await writeFile(join(project, 's.jsonl'), JSON.stringify({ type: 'message', role: 'user', content: 'hi', timestamp: 1000 }))
+    const persistence = { create: async () => undefined, append: async () => undefined }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      expect(await service.settings()).toEqual({})
+      await service.saveSettings({ maxFileBytes: 0 })
+      expect(await service.settings()).toEqual({ maxFileBytes: 0 })
+      expect((await service.preview()).sessions).toHaveLength(1)
+
+      await service.saveSettings({ maxFileBytes: 1 })
+      const limited = await service.preview()
+      expect(limited.sessions).toHaveLength(0)
+      expect(limited.source.warnings.some(item => item.code === 'file-too-large')).toBe(true)
+
+      await service.saveSettings({ maxFileBytes: 0 })
+      expect((await service.preview()).sessions).toHaveLength(1)
+      await expect(service.saveSettings({ maxFileBytes: -1 })).rejects.toThrow('non-negative integer')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+})

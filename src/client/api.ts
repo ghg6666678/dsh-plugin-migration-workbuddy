@@ -1,9 +1,15 @@
 import type { MigrationPreview, MigrationResult } from '../model.js'
 
+export interface MigrationSettings {
+  maxFileBytes?: number
+}
+
 export interface MigrationApi {
   preview(): Promise<MigrationPreview>
   run(input: { confirmed: true; sessions: boolean; memories: boolean; mcp: boolean; automations?: boolean; force?: boolean; sessionKeys?: string[]; workspaceIds?: string[]; automationIds?: string[] }): Promise<MigrationResult>
   manifest(): Promise<Record<string, unknown>>
+  settings(): Promise<MigrationSettings>
+  saveSettings(input: MigrationSettings): Promise<MigrationSettings>
   setMemoryEnabled(id: string, enabled: boolean): Promise<void>
   deleteMemory(id: string): Promise<boolean>
 }
@@ -26,6 +32,8 @@ export function createMigrationApi(): MigrationApi {
     preview: () => request<MigrationPreview>('/api/migration/workbuddy/preview'),
     run: input => request<MigrationResult>('/api/migration/workbuddy/run', { method: 'POST', body: JSON.stringify(input) }),
     manifest: () => request<Record<string, unknown>>('/api/migration/workbuddy/manifest'),
+    settings: () => request<MigrationSettings>('/api/migration/workbuddy/settings'),
+    saveSettings: input => request<MigrationSettings>('/api/migration/workbuddy/settings', { method: 'POST', body: JSON.stringify(input) }),
     setMemoryEnabled: async (id, enabled) => { await request('/api/migration/workbuddy/memory/update', { method: 'POST', body: JSON.stringify({ id, enabled }) }) },
     deleteMemory: async id => (await request<{ ok: boolean }>('/api/migration/workbuddy/memory/delete', { method: 'POST', body: JSON.stringify({ id }) })).ok,
   }

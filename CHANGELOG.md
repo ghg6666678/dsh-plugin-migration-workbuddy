@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.3.0 — 2026-11-11
+
+在「迁移与备份」设置页增加「导入设置」：
+
+- 直接设置**单文件上限（MiB，0 = 不限制）**，保存后立即重新扫描并刷新预览；
+- 值持久化在 `$DSH_HOME/migration/settings.json`，优先于 profile 里的插件配置（`maxFileBytes`）；
+- 新增 `GET/POST /api/migration/workbuddy/settings`，与其它写路由一样要求 loopback + 客户端标记头。
+
 ## v0.2.0 — 2026-11-11
 
 取消单文件大小上限，并改为流式解析：
