@@ -193,4 +193,25 @@ describe('WorkBuddy converter', () => {
       expect(Array.isArray(item.data?.stream)).toBe(true)
     }
   })
+
+  it('keeps a delayed tool result with its call instead of closing the step unresolved', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-converter-delayed-result-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'start', timestamp: 1000 }),
+      JSON.stringify({ type: 'function_call', callId: 'c1', name: 'read', arguments: '{}', timestamp: 1100 }),
+      JSON.stringify({ type: 'message', role: 'user', content: 'next', timestamp: 1200 }),
+      JSON.stringify({ type: 'function_call_result', callId: 'c1', output: 'ok', timestamp: 1300 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'done', timestamp: 1400 }),
+    ].join('\n'))
+
+    const converted = await convertWorkBuddySession(path, root)
+    expect(converted.loss.map(item => item.code)).not.toContain('unpaired-tool-call')
+    const types = (converted.events as Array<{ type?: string }>).map(event => event.type)
+    expect(types.filter(type => type === 'tool/call')).toHaveLength(1)
+    expect(types.filter(type => type === 'tool/result')).toHaveLength(1)
+    expect(types.filter(type => type === 'turn/start')).toHaveLength(2)
+    Session.create(SessionId('workbuddy-delayed-result'), converted.events as never[])
+  })
 })

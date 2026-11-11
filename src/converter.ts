@@ -183,14 +183,23 @@ class TurnAssembler {
   private bufferedCalls: PendingCall[] = []
   private readonly outstanding = new Map<string, PendingCall>()
 
+  private readonly deferred: Array<{ messages: UserMessageLike[]; time: number }> = []
+  private readonly synthesized: PendingCall[] = []
+  private readonly synthesizedIds = new Set<string>()
+
   /** A call this assembler emitted or buffered, waiting for its result. */
   knownCall(callId: string): PendingCall | undefined {
     return this.outstanding.get(callId)
   }
 
-  /** Calls still waiting for a result at end of input. */
-  outstandingCount(): number {
-    return this.outstanding.size
+  /** Whether a late result arrived for a call this assembler already closed. */
+  wasSynthesized(callId: string): boolean {
+    return this.synthesizedIds.has(callId)
+  }
+
+  /** Calls closed with a placeholder because their transcript lacked a result. */
+  get synthesizedCount(): number {
+    return this.synthesized.length
   }
 
   private event<T extends SessionEvent['type']>(type: T, data: SessionEvent<T>['data'], time: number): void {
@@ -236,6 +245,22 @@ class TurnAssembler {
 
   private closeStep(time: number): void {
     this.flush(time)
+    if (this.outstanding.size > 0) {
+      // The strict log validator refuses a step/end while an advertised call
+      // has no result, so close every orphan here — before the boundary.
+      this.ensureStep(time)
+      for (const call of [...this.outstanding.values()]) {
+        const message = createToolResultMessage({
+          callId: ToolCallId(call.callId),
+          content: content('WorkBuddy 未返回工具结果；此调用仅作为历史占位。'),
+          isError: true,
+        })
+        this.surface('tool/result', { turn: this.turn, step: this.step, message }, time)
+        this.outstanding.delete(call.callId)
+        this.synthesized.push(call)
+        this.synthesizedIds.add(call.callId)
+      }
+    }
     if (!this.stepOpen) return
     this.event('step/end', { turn: this.turn, step: this.step }, time)
     this.stepOpen = false
@@ -255,18 +280,50 @@ class TurnAssembler {
     this.ensureStep(time)
   }
 
-  user(message: UserMessageLike, time: number): void {
-    this.ensureStep(time)
-    this.surface('user/message', message, time)
+  /** Emit user rows that were held back while a tool call waited for its result. */
+  private flushDeferred(time: number): void {
+    if (this.deferred.length === 0 || this.outstanding.size > 0) return
+    const queue = this.deferred.splice(0)
+    this.beginTurn(time)
+    for (const row of queue) {
+      for (const message of row.messages) this.surface('user/message', message, row.time)
+    }
+  }
+
+  /**
+   * A user row starts a turn, unless a call is still waiting for its result:
+   * WorkBuddy may write the next user prompt before the tool result, and
+   * closing the turn there would leave the step with an unresolved call.
+   */
+  userRow(messages: UserMessageLike[], time: number): void {
+    if (this.outstanding.size > 0) {
+      this.deferred.push({ messages, time })
+      return
+    }
+    if (this.deferred.length > 0) {
+      this.deferred.push({ messages, time })
+      this.flushDeferred(time)
+      return
+    }
+    this.beginTurn(time)
+    for (const message of messages) this.surface('user/message', message, time)
   }
 
   assistant(blocks: ContentBlock[], time: number): void {
+    if (this.deferred.length > 0) {
+      if (this.outstanding.size > 0) this.closeTurn(time)
+      this.flushDeferred(time)
+    }
     if (this.stepHasResults) this.closeStep(time)
     this.ensureStep(time)
     this.bufferedBlocks.push(...blocks)
   }
 
   call(call: PendingCall, time: number): void {
+    if (this.deferred.length > 0) {
+      if (this.outstanding.size > 0) this.closeTurn(time)
+      this.flushDeferred(time)
+    }
     if (this.stepHasResults) this.closeStep(time)
     this.ensureStep(time)
     this.bufferedBlocks.push(...toolCallContent(call))
@@ -281,22 +338,12 @@ class TurnAssembler {
     this.surface('tool/result', { turn: this.turn, step: this.step, message }, time)
     this.stepHasResults = true
     this.outstanding.delete(call.callId)
+    if (this.outstanding.size === 0) this.flushDeferred(time)
   }
 
-  /** Close every outstanding call with an explicit error result, then the turn. */
   finish(time: number): void {
-    for (const call of [...this.outstanding.values()]) {
-      this.ensureStep(time)
-      this.flush(time)
-      const message = createToolResultMessage({
-        callId: ToolCallId(call.callId),
-        content: content('WorkBuddy 未返回工具结果；此调用仅作为历史占位。'),
-        isError: true,
-      })
-      this.surface('tool/result', { turn: this.turn, step: this.step, message }, time)
-      this.stepHasResults = true
-      this.outstanding.delete(call.callId)
-    }
+    this.closeTurn(time)
+    this.flushDeferred(time)
     this.closeTurn(time)
   }
 }
@@ -347,19 +394,19 @@ export async function convertWorkBuddySession(path: string, root: string, metada
       } else {
         const input = parsedInput!
         for (const warning of input.warnings) loss.push({ code: 'input-envelope-warning', detail: `line ${index + 1}: ${warning}` })
-        assembler.beginTurn(at)
+        const messages: UserMessageLike[] = []
         if (input.contextSections.length > 0) {
-          const contextMessage = createUserMessage({
+          messages.push(createUserMessage({
             content: content(input.contextSections.map(section => `${section.name}:\n${section.text}`).join('\n\n')),
             source: { kind: 'plugin', plugin: 'WorkBuddy 上下文', form: 'snapshot', sections: input.contextSections },
-          })
-          assembler.user(contextMessage, at)
+          }))
         }
         if (input.text !== '' || !input.hadContext) {
-          assembler.user(createUserMessage({ content: content(input.text), source: { kind: 'user' } }), at)
+          messages.push(createUserMessage({ content: content(input.text), source: { kind: 'user' } }))
         } else {
           loss.push({ code: 'context-only-message', detail: `line ${index + 1}: no user_query was present` })
         }
+        if (messages.length > 0) assembler.userRow(messages, at)
       }
     } else if (kind === 'reasoning') {
       assembler.assistant(content(textOf(row.rawContent ?? row.content), true), at)
@@ -392,7 +439,12 @@ export async function convertWorkBuddySession(path: string, root: string, metada
         continue
       }
       const known = assembler.knownCall(callId)
-      const orphan = known === undefined
+      const orphan = known === undefined && !assembler.wasSynthesized(callId)
+      if (assembler.wasSynthesized(callId)) {
+        loss.push({ code: 'duplicate-tool-result', detail: `line ${index + 1} (${callId}): result arrived after the call was closed` })
+        resultedCallIds.add(callId)
+        continue
+      }
       if (orphan) loss.push({ code: 'orphan-tool-result', detail: `line ${index + 1} (${callId})` })
       const call = known ?? { callId, name: sourceId(row.name, 'unknown-tool'), arguments: argumentsOf(row.arguments) }
       const resultMessage = createToolResultMessage({ callId: ToolCallId(callId), content: content(textOf(row.output ?? row.content)), isError })
@@ -402,10 +454,10 @@ export async function convertWorkBuddySession(path: string, root: string, metada
     } else if (kind === 'file-history-snapshot') loss.push({ code: 'file-history', detail: 'file history snapshots are not imported' })
     else loss.push({ code: 'unknown-event', detail: `${kind} at line ${index + 1}` })
   }
-  if (assembler.outstandingCount() > 0) {
-    loss.push({ code: 'unpaired-tool-call', detail: `${String(assembler.outstandingCount())} tool call(s) have no result` })
-  }
   assembler.finish(Number.isFinite(createdAt) ? createdAt : Date.now())
+  if (assembler.synthesizedCount > 0) {
+    loss.push({ code: 'unpaired-tool-call', detail: `${String(assembler.synthesizedCount)} tool call(s) had no result` })
+  }
   const events = assembler.events
   title ??= firstUserTitle
   // Titles are log-only metadata and must precede the seed turns. Explicit
