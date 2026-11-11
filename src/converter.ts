@@ -101,7 +101,9 @@ function memorySummaryEvent(section: { name: string; text: string }, time: numbe
     data: {
       ...createUserMessage({
         content: content(section.text),
-        source: { kind: 'plugin', plugin: 'WorkBuddy 历史摘要', form: 'snapshot', sections: [section] },
+        // Format v4 refuses the retired 'plugin' wrapper; the trim pass runs
+        // after normalizeMessageSources, so it must pick the kind here.
+        source: { kind: V4 ? IMPORT_SOURCE_KIND : 'plugin', plugin: 'WorkBuddy 历史摘要', form: 'snapshot', sections: [section] } as never,
       }),
     },
   } as unknown as SessionEvent

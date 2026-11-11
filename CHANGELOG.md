@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.4.1 — 2026-11-11
+
+修复「导入大项目（带摘要注入）后会话损坏」：
+
+- 裁剪时注入的历史摘要沿用了已废弃的 `source.kind = 'plugin'`，v4 宿主加载时报
+  `format v4 message requires a producer-owned source kind`；
+- 注入消息现在在 v4 宿主使用 `workbuddy-migration`（旧宿主仍用 `plugin`）；
+- 14 个导入会话已重新生成，扫描确认所有消息的 `source.kind` 均是 producer-owned。
+
 ## v0.4.0 — 2026-11-11
 
 导入会话改放到独立工作区「从WorkBuddy导入的对话」：
