@@ -398,7 +398,9 @@ export class MigrationService {
         const key = sourceKey(item, metadata, source.sourceRoot)
         const known = [...manifest.sessions].reverse().find(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path))
         const repair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
-        const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || known.metadataHash !== metadataHash(metadata) || (known.toolMode ?? 'transcript') !== this.toolMode())
+        // Metadata drift (title/cwd) must not force a re-import: that replaces
+        // the session and archives the old copy for no content change.
+        const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
         const status: MigrationPreview['sessions'][number]['status'] = known === undefined ? 'new' : repair ? 'repair' : changed ? 'changed' : 'unchanged'
         const workspaceId = workspaceIdOf(workspacePath)
         sessions.push({ path: item.path, sourceSessionId: item.sessionId, projectHash: item.projectHash, bytes: item.bytes, key, ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}), ...(workspaceId ? { workspaceId } : {}), status, eligible: status !== 'unchanged', eventCount: converted.events.length, loss: converted.loss, sourceHash: converted.sourceHash })
@@ -575,7 +577,7 @@ export class MigrationService {
           }
           const known = [...manifest.sessions].reverse().find(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path || entry.sourceHash === converted.sourceHash))
           const needsRepair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
-          const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || known.metadataHash !== metadataHash(metadata))
+          const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
           if (known && selection.force !== true && !needsRepair && !changed) { result.skippedSessions += 1; batch.skippedSessions += 1; continue }
           const targetId = known ? `${converted.targetSessionId}-${Date.now().toString(36)}` : converted.targetSessionId
           if (known && this.workspaceRegistry) {
