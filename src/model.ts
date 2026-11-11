@@ -6,6 +6,7 @@ export const MIGRATION_FORMAT_VERSION = 2
 export type ProbeWarningCode =
   | 'missing-root'
   | 'file-too-large'
+  | 'large-file'
   | 'file-limit'
   | 'symlink-skipped'
   | 'invalid-json'

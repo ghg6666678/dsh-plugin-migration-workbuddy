@@ -13,7 +13,9 @@ import type {
 } from './model.js'
 import { PROBE_FORMAT_VERSION } from './model.js'
 
-export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
+/** 0 = no per-file cap; transcripts are streamed, not buffered whole. */
+export const DEFAULT_MAX_FILE_BYTES = 0
+const LARGE_FILE_WARNING_BYTES = 64 * 1024 * 1024
 export const DEFAULT_MAX_FILES = 5_000
 const KNOWN_EVENTS = new Set([
   'message',
@@ -127,9 +129,12 @@ async function inspectJsonl(path: string, root: string, warnings: ProbeWarning[]
     warnings.push({ code: 'read-failed', path, detail: cause instanceof Error ? cause.message : String(cause) })
     return undefined
   }
-  if (bytes > maxFileBytes) {
+  if (maxFileBytes > 0 && bytes > maxFileBytes) {
     warnings.push({ code: 'file-too-large', path, detail: `${String(bytes)} bytes exceeds ${String(maxFileBytes)}-byte limit` })
     return undefined
+  }
+  if (bytes > LARGE_FILE_WARNING_BYTES) {
+    warnings.push({ code: 'large-file', path, detail: `${String(bytes)} bytes; converting a very large transcript may take a while` })
   }
   const relativePath = relative(join(root, 'projects'), path)
   const parts = relativePath.split(sep)

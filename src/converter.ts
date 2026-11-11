@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
 import { basename, isAbsolute, relative, sep } from 'node:path'
+import { createInterface } from 'node:readline'
 import { createAssistantMessage, createToolResultMessage, createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, SessionId, SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -351,12 +352,9 @@ class TurnAssembler {
 /** Convert one WorkBuddy JSONL file to DSH's durable event vocabulary. */
 export async function convertWorkBuddySession(path: string, root: string, metadata?: WorkBuddySessionMetadata, options: ConvertOptions = {}): Promise<ConvertedSession> {
   const toolMode: ToolMode = options.toolMode ?? 'transcript'
-  const raw = await readFile(path, 'utf8')
-  const sourceHash = createHash('sha256').update(raw).digest('hex')
   const sourceSessionId = basename(path, '.jsonl')
   const parts = relative(`${root}/projects`, path).split(sep)
   const projectHash = parts[0] ?? 'unknown'
-  const lines = raw.split(/\r?\n/)
   const assembler = new TurnAssembler()
   const loss: LossRecord[] = []
   // WorkBuddy can repeat the same call/result row (retries, streamed updates).
@@ -368,13 +366,21 @@ export async function convertWorkBuddySession(path: string, root: string, metada
   let firstUserTitle: string | undefined
   let createdAt = Number.POSITIVE_INFINITY
   let cwd: string | undefined = metadata?.cwd
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]?.trim()
+  // Stream the transcript: a project can be hundreds of MiB, and reading it as
+  // one string both spikes memory and exceeds V8's string limit.
+  const digest = createHash('sha256')
+  const stream = createReadStream(path)
+  stream.on('data', (chunk: string | Buffer) => { digest.update(chunk) })
+  const input = createInterface({ input: stream, crlfDelay: Infinity })
+  let lineNumber = 0
+  for await (const rawLine of input) {
+    lineNumber += 1
+    const line = rawLine.trim()
     if (!line) continue
     let parsed: unknown
-    try { parsed = JSON.parse(line) } catch { loss.push({ code: 'invalid-json', detail: `line ${index + 1}` }); continue }
+    try { parsed = JSON.parse(line) } catch { loss.push({ code: 'invalid-json', detail: `line ${lineNumber}` }); continue }
     const row = record(parsed)
-    if (row === undefined) { loss.push({ code: 'invalid-record', detail: `line ${index + 1}` }); continue }
+    if (row === undefined) { loss.push({ code: 'invalid-record', detail: `line ${lineNumber}` }); continue }
     const kind = sourceId(row.type ?? row.event ?? row.kind, 'unknown')
     const at = timeOf(row.timestamp ?? row.time ?? row.createdAt, Date.now())
     createdAt = Math.min(createdAt, at)
@@ -393,7 +399,7 @@ export async function convertWorkBuddySession(path: string, root: string, metada
         assembler.assistant(content(textOf(row.content)), at)
       } else {
         const input = parsedInput!
-        for (const warning of input.warnings) loss.push({ code: 'input-envelope-warning', detail: `line ${index + 1}: ${warning}` })
+        for (const warning of input.warnings) loss.push({ code: 'input-envelope-warning', detail: `line ${lineNumber}: ${warning}` })
         const messages: UserMessageLike[] = []
         if (input.contextSections.length > 0) {
           messages.push(createUserMessage({
@@ -404,56 +410,57 @@ export async function convertWorkBuddySession(path: string, root: string, metada
         if (input.text !== '' || !input.hadContext) {
           messages.push(createUserMessage({ content: content(input.text), source: { kind: 'user' } }))
         } else {
-          loss.push({ code: 'context-only-message', detail: `line ${index + 1}: no user_query was present` })
+          loss.push({ code: 'context-only-message', detail: `line ${lineNumber}: no user_query was present` })
         }
         if (messages.length > 0) assembler.userRow(messages, at)
       }
     } else if (kind === 'reasoning') {
       assembler.assistant(content(textOf(row.rawContent ?? row.content), true), at)
     } else if (kind === 'function_call') {
-      const callId = sourceId(row.callId ?? row.id, `workbuddy-call-${index}`)
+      const callId = sourceId(row.callId ?? row.id, `workbuddy-call-${lineNumber}`)
       const callName = sourceId(row.name, 'unknown-tool')
       const callArguments = argumentsOf(row.arguments)
       if (toolMode === 'narrative') {
         assembler.assistant(content(`【工具调用 ${callName}】${callArguments}`), at)
-        loss.push({ code: 'tool-flattened', detail: `line ${index + 1} (${callId})` })
+        loss.push({ code: 'tool-flattened', detail: `line ${lineNumber} (${callId})` })
         continue
       }
       if (emittedCallIds.has(callId) || resultedCallIds.has(callId)) {
-        loss.push({ code: 'duplicate-tool-call', detail: `line ${index + 1} (${callId})` })
+        loss.push({ code: 'duplicate-tool-call', detail: `line ${lineNumber} (${callId})` })
         continue
       }
       assembler.call({ callId, name: callName, arguments: callArguments }, at)
       emittedCallIds.add(callId)
     } else if (kind === 'function_call_result') {
-      const callId = sourceId(row.callId ?? row.id, `workbuddy-call-${index}`)
+      const callId = sourceId(row.callId ?? row.id, `workbuddy-call-${lineNumber}`)
       const isError = row.status === 'error' || row.isError === true
       if (toolMode === 'narrative') {
         const outputText = textOf(row.output ?? row.content)
         assembler.assistant(content(`【工具结果${isError ? '（错误）' : ''}】${outputText}`), at)
-        loss.push({ code: 'tool-result-flattened', detail: `line ${index + 1} (${callId})` })
+        loss.push({ code: 'tool-result-flattened', detail: `line ${lineNumber} (${callId})` })
         continue
       }
       if (resultedCallIds.has(callId)) {
-        loss.push({ code: 'duplicate-tool-result', detail: `line ${index + 1} (${callId})` })
+        loss.push({ code: 'duplicate-tool-result', detail: `line ${lineNumber} (${callId})` })
         continue
       }
       const known = assembler.knownCall(callId)
       const orphan = known === undefined && !assembler.wasSynthesized(callId)
       if (assembler.wasSynthesized(callId)) {
-        loss.push({ code: 'duplicate-tool-result', detail: `line ${index + 1} (${callId}): result arrived after the call was closed` })
+        loss.push({ code: 'duplicate-tool-result', detail: `line ${lineNumber} (${callId}): result arrived after the call was closed` })
         resultedCallIds.add(callId)
         continue
       }
-      if (orphan) loss.push({ code: 'orphan-tool-result', detail: `line ${index + 1} (${callId})` })
+      if (orphan) loss.push({ code: 'orphan-tool-result', detail: `line ${lineNumber} (${callId})` })
       const call = known ?? { callId, name: sourceId(row.name, 'unknown-tool'), arguments: argumentsOf(row.arguments) }
       const resultMessage = createToolResultMessage({ callId: ToolCallId(callId), content: content(textOf(row.output ?? row.content)), isError })
       assembler.result(call, resultMessage, orphan, at)
       resultedCallIds.add(callId)
       if (orphan) emittedCallIds.add(callId)
     } else if (kind === 'file-history-snapshot') loss.push({ code: 'file-history', detail: 'file history snapshots are not imported' })
-    else loss.push({ code: 'unknown-event', detail: `${kind} at line ${index + 1}` })
+    else loss.push({ code: 'unknown-event', detail: `${kind} at line ${lineNumber}` })
   }
+  const sourceHash = digest.digest('hex')
   assembler.finish(Number.isFinite(createdAt) ? createdAt : Date.now())
   if (assembler.synthesizedCount > 0) {
     loss.push({ code: 'unpaired-tool-call', detail: `${String(assembler.synthesizedCount)} tool call(s) had no result` })

@@ -109,7 +109,7 @@ Restart DSH and the settings page shows “Migration & backup”.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | When false the plugin never touches the disk |
-| `maxFileBytes` | `10485760` | Per-source-file limit (1 KiB – 100 MiB) |
+| `maxFileBytes` | `0` | Per-source-file cap in bytes; `0` means unlimited. Transcripts are streamed, never buffered whole |
 | `maxFiles` | `5000` | Files scanned in one pass |
 | `toolMode` | `transcript` | `transcript` keeps the full tool protocol: one user request is one turn, each assistant round is one step, and a call plus its result share that step, so DSH recognizes the input/output pairing; `narrative` flattens calls/results into text |
 | `automationModelId` | `''` | Model id written into every migrated automation rule; empty uses the deployment default |
