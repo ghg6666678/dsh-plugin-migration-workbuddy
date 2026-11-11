@@ -5,7 +5,7 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { SESSION_FORMAT_VERSION, SessionId, SessionLogOffset, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
-import { convertWorkBuddySession, MIGRATION_CONVERTER_VERSION } from './converter.js'
+import { convertWorkBuddySession, MIGRATION_CONVERTER_VERSION, trimEventsToBudget } from './converter.js'
 import type {
   McpDraft, MemoryRecord, MigrationPreview, MigrationResult, MigrationSelection, ProbeReport, WorkspaceSummary,
 } from './model.js'
@@ -273,16 +273,19 @@ async function automationRuleFor(draft: AutomationDraft, workspacePath: string |
 export interface MigrationSettings {
   /** Per-file cap in bytes; 0 = no cap. Absent = use the deployment config. */
   maxFileBytes?: number
+  /** Estimated context-token budget for one seed; 0 = keep everything. */
+  maxContextTokens?: number
 }
 
 function sanitizeSettings(value: unknown): MigrationSettings {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return {}
   const record = value as Record<string, unknown>
   const result: MigrationSettings = {}
-  if (record.maxFileBytes !== undefined) {
-    const raw = record.maxFileBytes
-    if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) throw new Error('maxFileBytes must be a non-negative integer')
-    result.maxFileBytes = raw
+  for (const key of ['maxFileBytes', 'maxContextTokens'] as const) {
+    if (record[key] === undefined) continue
+    const raw = record[key]
+    if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) throw new Error(`${key} must be a non-negative integer`)
+    result[key] = raw
   }
   return result
 }
@@ -297,7 +300,7 @@ export class MigrationService {
   constructor(
     private readonly persistence: SessionPersistence,
     private readonly workspaceRegistry?: WorkspaceLike,
-    private readonly options: { sourceRoot?: string; maxFileBytes?: number; maxFiles?: number; toolMode?: 'transcript' | 'narrative'; automationModelId?: string; automationModelAllowlist?: string[]; saveAutomationRule?: (rule: unknown) => Promise<void> } = {},
+    private readonly options: { sourceRoot?: string; maxFileBytes?: number; maxContextTokens?: number; maxFiles?: number; toolMode?: 'transcript' | 'narrative'; automationModelId?: string; automationModelAllowlist?: string[]; saveAutomationRule?: (rule: unknown) => Promise<void> } = {},
   ) {
     const root = targetRoot()
     this.manifestPath = join(root, 'migration', 'manifest.json')
@@ -329,6 +332,11 @@ export class MigrationService {
   private async effectiveMaxFileBytes(): Promise<number | undefined> {
     const settings = await this.settings()
     return settings.maxFileBytes ?? this.options.maxFileBytes
+  }
+
+  private async effectiveMaxContextTokens(): Promise<number> {
+    const settings = await this.settings()
+    return settings.maxContextTokens ?? this.options.maxContextTokens ?? 500_000
   }
 
   /** Migrated automations must not carry WorkBuddy model ids (unknown on the gateway). */
@@ -515,6 +523,7 @@ export class MigrationService {
       const keyFilter = new Set(sessionKeys)
       const wsFilter = new Set(workspaceIds)
       const hasFilter = keyFilter.size > 0 || wsFilter.size > 0
+      const contextBudget = await this.effectiveMaxContextTokens()
       const allSourceKeys = new Set<string>()
       const allSourceWids = new Set<string>()
       for (const item of source.sessions) {
@@ -545,6 +554,13 @@ export class MigrationService {
             }
           }
           const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode() })
+          if (contextBudget > 0) {
+            const trimmed = trimEventsToBudget(converted.events as SessionEvent[], contextBudget * 3)
+            if (trimmed.droppedTurns > 0) {
+              converted.events = trimmed.events
+              result.loss.push({ code: 'context-trimmed', detail: `${String(trimmed.droppedTurns)} earlier turn(s) omitted to fit the ${String(contextBudget)}-token context budget` })
+            }
+          }
           if (hasFilter) {
             const finalWorkspacePath = metadata?.mode === 'session' ? sessionWorkspacePath : (converted.cwd ?? projectWorkspacePath(converted.projectHash))
             const finalWid = workspaceIdOf(finalWorkspacePath)

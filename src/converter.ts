@@ -24,6 +24,82 @@ export const MIGRATION_CONVERTER_VERSION = 9
 
 export type ToolMode = 'transcript' | 'narrative'
 
+const SURFACE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/result', 'system/message'])
+
+/** A protected system head for a seed that starts mid-conversation. */
+function systemHeadEvent(turn: number, step: number, time: number): SessionEvent {
+  return {
+    type: 'system/message',
+    seq: 0,
+    time,
+    surfaceOp: 'append',
+    data: {
+      turn,
+      step,
+      message: {
+        id: randomUUID(),
+        role: 'system',
+        source: { kind: 'system-prompt' },
+        content: [{ type: 'text', text: 'WorkBuddy 导入的历史记录（较早轮次已按上下文预算省略；系统提示由当前部署在后续轮次重新提供）。' }],
+      },
+    },
+  } as unknown as SessionEvent
+}
+
+/** Insert the protected system head right after the first step/start when missing. */
+function ensureSystemHead(events: SessionEvent[]): SessionEvent[] {
+  const firstSurface = events.findIndex(event => SURFACE_EVENT_TYPES.has(event.type))
+  if (firstSurface === -1 || (events[firstSurface] as { type?: string }).type === 'system/message') return events
+  let stepIndex = -1
+  for (let index = firstSurface - 1; index >= 0; index -= 1) {
+    if (events[index]!.type === 'step/start') { stepIndex = index; break }
+  }
+  if (stepIndex === -1) return events
+  const stepData = events[stepIndex]!.data as { turn: number; step: number }
+  const head = systemHeadEvent(stepData.turn, stepData.step, events[firstSurface]!.time)
+  return [...events.slice(0, stepIndex + 1), head, ...events.slice(stepIndex + 1)]
+}
+
+/**
+ * Drop the oldest turns until the seed fits the model context budget.
+ *
+ * A large WorkBuddy project can exceed the provider's context window once the
+ * whole transcript is sent as history. Keeping the most recent turns and a
+ * protected system head keeps the session continuable.
+ */
+export function trimEventsToBudget(events: SessionEvent[], budgetChars: number): { events: SessionEvent[]; droppedTurns: number } {
+  if (budgetChars <= 0 || events.length === 0) return { events, droppedTurns: 0 }
+  const starts: number[] = []
+  for (let index = 0; index < events.length; index += 1) if (events[index]!.type === 'turn/start') starts.push(index)
+  if (starts.length <= 1) return { events, droppedTurns: 0 }
+  const prefix = events.slice(0, starts[0])
+  const turns = starts.map((start, index) => events.slice(start, index + 1 < starts.length ? starts[index + 1] : events.length))
+  let total = 0
+  for (const turn of turns) for (const event of turn) total += JSON.stringify(event).length
+  if (total <= budgetChars) return { events, droppedTurns: 0 }
+
+  let accumulated = 0
+  let keepFrom = turns.length
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    accumulated += turns[index]!.reduce((sum, event) => sum + JSON.stringify(event).length, 0)
+    if (accumulated > budgetChars) break
+    keepFrom = index
+  }
+  if (keepFrom === 0) keepFrom = 1
+  if (keepFrom >= turns.length) keepFrom = turns.length - 1
+  const kept = [...prefix, ...turns.slice(keepFrom).flat()]
+  // Turn numbers are one-based and sequential in DSH; renumber the kept window.
+  const firstTurn = kept.find(event => event.type === 'turn/start')
+  const baseTurn = firstTurn === undefined ? 1 : Number((firstTurn.data as { turn: number }).turn)
+  for (const event of kept) {
+    const data = (event as unknown as { data?: { turn?: unknown } }).data
+    if (data !== undefined && typeof data.turn === 'number') data.turn = data.turn - baseTurn + 1
+  }
+  const withHead = ensureSystemHead(kept)
+  for (let index = 0; index < withHead.length; index += 1) (withHead[index] as unknown as { seq: number }).seq = index
+  return { events: withHead, droppedTurns: keepFrom }
+}
+
 export interface ConvertOptions {
   toolMode?: ToolMode
 }

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { convertWorkBuddySession } from '../src/converter.js'
+import { convertWorkBuddySession, trimEventsToBudget } from '../src/converter.js'
 
 /** The pinned test peer predates system/message; derive messages without it. */
 function derivable(events: readonly unknown[]): never[] {
@@ -221,5 +221,32 @@ describe('WorkBuddy converter', () => {
     expect(types.filter(type => type === 'tool/result')).toHaveLength(1)
     expect(types.filter(type => type === 'turn/start')).toHaveLength(2)
     Session.create(SessionId('workbuddy-delayed-result'), derivable(converted.events))
+  })
+})
+
+describe('WorkBuddy converter context budget', () => {
+  it('drops the oldest turns and renumbers the kept window', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-converter-budget-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'one', timestamp: 1000 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'first', timestamp: 1100 }),
+      JSON.stringify({ type: 'message', role: 'user', content: 'two', timestamp: 1200 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'second', timestamp: 1300 }),
+      JSON.stringify({ type: 'message', role: 'user', content: 'three', timestamp: 1400 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'third', timestamp: 1500 }),
+    ].join('\n'))
+
+    const converted = await convertWorkBuddySession(path, root)
+    const before = (converted.events as Array<{ type?: string }>).filter(event => event.type === 'turn/start').length
+    expect(before).toBe(3)
+    const trimmed = trimEventsToBudget(converted.events as never[], 1)
+    expect(trimmed.droppedTurns).toBeGreaterThan(0)
+    const events = trimmed.events as Array<{ type?: string; data?: { turn?: number } }>
+    const turns = events.filter(event => event.type === 'turn/start')
+    expect(turns.length).toBeLessThan(before)
+    expect(turns.map(event => event.data?.turn)).toEqual(turns.map((_event, index) => index + 1))
+    expect(events.some(event => event.type === 'system/message')).toBe(true)
   })
 })

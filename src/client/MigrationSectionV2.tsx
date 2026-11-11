@@ -27,6 +27,7 @@ export function MigrationSection({ t, api }: MigrationSectionProps): React.React
   const [manifestLoading, setManifestLoading] = useState(false)
   const [manifestError, setManifestError] = useState<string>()
   const [limitMib, setLimitMib] = useState('0')
+  const [limitTokens, setLimitTokens] = useState('500')
   const [savingLimit, setSavingLimit] = useState(false)
 
   const eligibleItems = (value: MigrationPreview | undefined): MigrationPreview['sessions'] => value?.sessions.filter(item => item.status === 'new' || item.status === 'changed' || item.status === 'repair') ?? []
@@ -38,7 +39,10 @@ export function MigrationSection({ t, api }: MigrationSectionProps): React.React
   useEffect(() => { refresh() }, [])
   useEffect(() => {
     void api.settings()
-      .then(value => setLimitMib(String(Math.max(0, Math.round((value.maxFileBytes ?? 0) / (1024 * 1024))))))
+      .then(value => {
+        setLimitMib(String(Math.max(0, Math.round((value.maxFileBytes ?? 0) / (1024 * 1024)))))
+        setLimitTokens(String(Math.max(0, Math.round((value.maxContextTokens ?? 500_000) / 1000))))
+      })
       .catch(() => undefined)
   }, [])
 
@@ -46,9 +50,11 @@ export function MigrationSection({ t, api }: MigrationSectionProps): React.React
     setSavingLimit(true); setError(undefined)
     try {
       const mib = Math.max(0, Math.floor(Number(limitMib)))
-      if (!Number.isFinite(mib)) throw new Error(t('settingsLimit'))
-      const saved = await api.saveSettings({ maxFileBytes: mib * 1024 * 1024 })
+      const tokens = Math.max(0, Math.floor(Number(limitTokens)))
+      if (!Number.isFinite(mib) || !Number.isFinite(tokens)) throw new Error(t('settingsTitle'))
+      const saved = await api.saveSettings({ maxFileBytes: mib * 1024 * 1024, maxContextTokens: tokens * 1000 })
       setLimitMib(String(Math.round((saved.maxFileBytes ?? 0) / (1024 * 1024))))
+      setLimitTokens(String(Math.round((saved.maxContextTokens ?? 500_000) / 1000)))
       refresh()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -127,7 +133,7 @@ export function MigrationSection({ t, api }: MigrationSectionProps): React.React
   return <section className="mwb-migration"><style>{styles}</style>
     <div className="mwb-migration-hero"><div className="mwb-migration-kicker">WORKBUDDY · DATA BRIDGE</div><h2>{t('title')}</h2><p>{t('intro')}</p></div>
     <div className="mwb-migration-toolbar"><span className="mwb-migration-source">{loading ? t('preview') : total > 0 ? `✓ ${t('sourceFound')}` : t('sourceMissing')}</span><button className="mwb-migration-refresh" type="button" onClick={refresh} disabled={loading}>{t('refresh')}</button></div>
-    <div className="mwb-migration-settings"><strong>{t('settingsTitle')}</strong><label>{t('settingsLimit')} <input type="number" min={0} step={1} value={limitMib} onChange={event => setLimitMib(event.target.value)} /> {t('settingsUnlimited')}</label><button className="mwb-migration-secondary" type="button" disabled={savingLimit} onClick={() => { void saveLimit() }}>{savingLimit ? t('working') : t('settingsSave')}</button></div>
+    <div className="mwb-migration-settings"><strong>{t('settingsTitle')}</strong><label>{t('settingsLimit')} <input type="number" min={0} step={1} value={limitMib} onChange={event => setLimitMib(event.target.value)} /> {t('settingsUnlimited')}</label><label>{t('settingsContext')} <input type="number" min={0} step={1} value={limitTokens} onChange={event => setLimitTokens(event.target.value)} /></label><button className="mwb-migration-secondary" type="button" disabled={savingLimit} onClick={() => { void saveLimit() }}>{savingLimit ? t('working') : t('settingsSave')}</button></div>
     {error ? <div className="mwb-migration-error">{error}</div> : null}
     {loading ? null : preview && total > 0 ? <>
       <div className="mwb-migration-status">{canRun ? `${t('newItems')} ${Math.max(0, sessionEligible - counts.changed - counts.repair)} · ${t('changedItems')} ${counts.changed} · ${t('repairItems')} ${counts.repair} · ${t('memories')} ${counts.memoryEligible} · ${t('mcp')} ${counts.mcpEligible}` : t('upToDate')}{counts.lastImportedAt ? ` · ${t('lastImported')}: ${new Date(counts.lastImportedAt).toLocaleString()}` : ''}{counts.excludedDeletedSessions > 0 || counts.excludedMissingWorkspaces > 0 ? ` · ${t('excluded').replace('{deleted}', String(counts.excludedDeletedSessions)).replace('{missing}', counts.excludedMissingWorkspaces > 0 ? ` + ${String(counts.excludedMissingWorkspaces)} ${t('workspaceMode')}` : '')}` : ''}</div>

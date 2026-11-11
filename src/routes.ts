@@ -140,10 +140,16 @@ export function registerMigrationRoutes(webserver: WebServer, config: MigrationC
           if (req.method === 'GET') { sendJson(res, 200, await service.settings()); return }
           if (req.method === 'POST') {
             const input = await body(req)
-            if (typeof input.maxFileBytes !== 'number' || !Number.isSafeInteger(input.maxFileBytes) || input.maxFileBytes < 0) {
-              sendJson(res, 400, { error: 'maxFileBytes must be a non-negative integer' }); return
+            const patch: { maxFileBytes?: number; maxContextTokens?: number } = {}
+            for (const key of ['maxFileBytes', 'maxContextTokens'] as const) {
+              if (input[key] === undefined) continue
+              const value = input[key]
+              if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+                sendJson(res, 400, { error: `${key} must be a non-negative integer` }); return
+              }
+              patch[key] = value
             }
-            sendJson(res, 200, await service.saveSettings({ maxFileBytes: input.maxFileBytes })); return
+            sendJson(res, 200, await service.saveSettings(patch)); return
           }
           sendJson(res, 405, { error: 'GET or POST required' }); return
         }

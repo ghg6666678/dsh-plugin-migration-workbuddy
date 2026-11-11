@@ -104,6 +104,7 @@ dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
 | `maxFileBytes` | `0` | 单个源文件上限（字节）；`0` = 不限制。转录是流式读取的，不会把整个文件读进内存。也可在设置页「导入设置」里按 MiB 调整，页面值优先 |
 | `maxFiles` | `5000` | 单次扫描文件数上限 |
 | `toolMode` | `transcript` | `transcript` 保留完整工具协议：一个用户请求 = 一个 turn，每轮助手回复 = 一个 step，工具调用与结果留在同一个 step 里，DSH 能正确识别输入/输出；`narrative` 把工具调用/结果拍平为文本，导入历史不带工具协议 |
+| `maxContextTokens` | `500000` | 单个导入会话的上下文预算（估算 token）；超出时从最早的 turn 开始丢弃，只保留最近轮次；`0` = 不裁剪。也可在设置页调整 |
 | `automationModelId` | `''` | 迁移的自动化规则写死的模型 id；空 = 用部署默认模型 |
 | `automationModelAllowlist` | `[]` | 允许原样透传的模型 id；其余按 `automationModelId` 改写并记 `automation-model-remapped` |
 

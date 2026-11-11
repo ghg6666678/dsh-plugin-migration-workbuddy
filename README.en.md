@@ -112,6 +112,7 @@ Restart DSH and the settings page shows “Migration & backup”.
 | `maxFileBytes` | `0` | Per-source-file cap in bytes; `0` means unlimited. Transcripts are streamed, never buffered whole |
 | `maxFiles` | `5000` | Files scanned in one pass |
 | `toolMode` | `transcript` | `transcript` keeps the full tool protocol: one user request is one turn, each assistant round is one step, and a call plus its result share that step, so DSH recognizes the input/output pairing; `narrative` flattens calls/results into text |
+| `maxContextTokens` | `500000` | Estimated context-token budget per imported session; older turns are dropped when exceeded (`0` = keep everything) |
 | `automationModelId` | `''` | Model id written into every migrated automation rule; empty uses the deployment default |
 | `automationModelAllowlist` | `[]` | Model ids carried over verbatim; everything else is rewritten to `automationModelId` with an `automation-model-remapped` loss |
 

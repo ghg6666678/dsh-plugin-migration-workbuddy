@@ -33,6 +33,9 @@ export function apply(ctx: Context, rawConfig: Partial<ReturnType<typeof normali
     ? undefined
     : async (rule: unknown): Promise<void> => { await bound.call(channel, rule) }
   const service = new MigrationService(ctx.sessionPersistence, ctx.get('workspaceRegistry'), {
+    maxFileBytes: config.maxFileBytes,
+    maxContextTokens: config.maxContextTokens,
+    maxFiles: config.maxFiles,
     toolMode: config.toolMode,
     automationModelId: config.automationModelId,
     automationModelAllowlist: config.automationModelAllowlist,
