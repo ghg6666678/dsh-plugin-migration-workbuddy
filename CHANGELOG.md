@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.1.9 — 2026-11-11
+
+修复会话模式导入的落点：新版 WorkBuddy 会在每一行里带上绝对 `cwd`，旧逻辑优先使用它，
+于是会话被写进 WorkBuddy 项目路径，而 workspace 注册仍然指向「会话模式」。
+
+现在 `metadata.mode === 'session'` 时 `header.cwd` 固定为 `$DSH_HOME/workspaces/session-mode`，
+与已导入的会话保持一致；workspace 模式仍使用对话里的权威 `cwd`。
+
 ## v0.1.8 — 2026-11-11
 
 继续清理 WorkBuddy 生成内容在会话里的显示：

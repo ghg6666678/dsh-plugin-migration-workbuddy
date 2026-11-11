@@ -521,7 +521,13 @@ export class MigrationService {
               result.loss.push({ code: 'legacy-session-archive-failed', detail: cause instanceof Error ? cause.message : String(cause) })
             }
           }
-          const header: SessionHeader = { version: SESSION_FORMAT_VERSION, id: SessionId(targetId), createdAt: converted.createdAt, isSeeded: true, ...((converted.cwd ?? (metadata?.mode === 'session' ? sessionWorkspacePath : undefined)) ? { cwd: converted.cwd ?? sessionWorkspacePath } : {}) }
+          // Session-mode sessions always belong to the shared session-mode
+          // workspace. The transcript may carry its own absolute `cwd` (newer
+          // WorkBuddy builds stamp it on every row); using that here would
+          // store the session under a WorkBuddy project path while workspace
+          // registration below still targets session-mode.
+          const headerCwd = metadata?.mode === 'session' ? sessionWorkspacePath : (converted.cwd ?? projectWorkspacePath(converted.projectHash))
+          const header: SessionHeader = { version: SESSION_FORMAT_VERSION, id: SessionId(targetId), createdAt: converted.createdAt, isSeeded: true, ...(headerCwd ? { cwd: headerCwd } : {}) }
           // Imported history is a SEED prefix with an exact inherited count: the
           // runtime then treats [0, events.length) as seed and never replays the
           // imported log into the live surface, which would otherwise duplicate
