@@ -1,5 +1,20 @@
 # 更新日志
 
+## v0.1.2 — 2026-11-11
+
+修复导入后的会话打不开：`stored session ... is corrupt: released v2 seeded Session lacks an
+inherited end-seed marker`。
+
+当前会话格式（v4）的物理 header 只记录 `isSeeded`，继承切点由日志里最后一条
+`session/end-seed { inherited: true }` 事件推导。`sessionPersistence.create()` 只写 header，
+v0.1.1 通过原始写入句柄追加 seed 事件时没有补这条标记，于是导入成功的会话在下次打开时全部
+被判为损坏（标题显示「未命名」，历史加载失败），而 manifest 仍认为已导入。
+
+v0.1.2 在写入 seed 事件的同一批里追加该标记（空会话也写），与 Session 种子构造函数的行为一致。
+
+> 已用 v0.1.1 导入过的会话不会自动变好：需要在这些日志末尾补一条
+> `{"type":"session/end-seed","seq":<事件数>,"time":<最后时间>,"data":{"inherited":true}}`。
+
 ## v0.1.1 — 2026-11-11
 
 适配 DSH 0.2.x（实测 `0.2.2-rc.1`）。

@@ -30,6 +30,27 @@ interface SessionWriteHandle {
 }
 
 /**
+ * Build the inherited-cut marker required by the current session format.
+ *
+ * Since format v4 the physical header carries `isSeeded` but no numeric cut:
+ * the reader derives the inherited prefix from the last
+ * `session/end-seed { inherited: true }` row. `sessionPersistence.create()`
+ * only writes the header, so a caller that appends seed events through the
+ * raw handle must append this marker itself — the Session seed constructor
+ * does the same. Without it every later open fails with
+ * "released v2 seeded Session lacks an inherited end-seed marker".
+ */
+export function seedEndMarker(events: readonly SessionEvent[], createdAt: number): SessionEvent {
+  const last = events[events.length - 1]
+  return {
+    type: 'session/end-seed',
+    seq: events.length,
+    time: last?.time ?? createdAt,
+    data: { inherited: true },
+  } as unknown as SessionEvent
+}
+
+/**
  * Persist a seeded session across both persistence generations.
  *
  * dsh 0.1.x exposes persistence.append(id, events) and takes the seed offset as
@@ -58,7 +79,9 @@ export async function writeSeededSession(
     throw new Error('unsupported sessionPersistence API: create() returned no write handle and append() is unavailable')
   }
   try {
-    await handle.append(events)
+    // Format v4 stores the inherited cut as an event, not in the header.
+    const batch = header.version >= 4 ? [...events, seedEndMarker(events, header.createdAt)] : events
+    await handle.append(batch)
     await handle.flush?.()
   } finally {
     // A failed append (e.g. a format rejection) must still release the write
