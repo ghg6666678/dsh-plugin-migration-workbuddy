@@ -1,6 +1,7 @@
-import { existsSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
-import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 
 export type WorkBuddyMode = 'workspace' | 'session' | 'unknown'
 
@@ -26,6 +27,12 @@ export interface WorkBuddyCatalog {
   liveWorkspacePaths: ReadonlySet<string>
   /** False when the database is missing or unreadable (degraded fallback). */
   available: boolean
+  /**
+   * Why the catalog is unavailable. `unreadable` means the database file is
+   * there but could not be read — deletion state is unknown and callers must
+   * not import transcripts, or they would resurrect deleted sessions.
+   */
+  unavailableReason?: 'missing' | 'unreadable'
 }
 
 type Row = {
@@ -51,8 +58,34 @@ function isDeleted(value: unknown): boolean {
   return true
 }
 
-function emptyCatalog(): WorkBuddyCatalog {
-  return { sessions: new Map(), deletedSessionIds: new Set(), liveWorkspacePaths: new Set(), available: false }
+function emptyCatalog(unavailableReason: 'missing' | 'unreadable'): WorkBuddyCatalog {
+  return { sessions: new Map(), deletedSessionIds: new Set(), liveWorkspacePaths: new Set(), available: false, unavailableReason }
+}
+
+/**
+ * Open the database read-only, copying it aside when a running WorkBuddy keeps
+ * an exclusive lock. The copy also covers WAL databases whose `-shm` cannot be
+ * opened read-only; deletion state must stay readable rather than silently
+ * degrade to "nothing is deleted".
+ */
+function openCatalog(path: string): { db: DatabaseSync; dispose?: () => void } | undefined {
+  try {
+    return { db: new DatabaseSync(path, { readOnly: true }) }
+  } catch { /* try the copy fallback below */ }
+  let dir: string | undefined
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'dsh-wb-catalog-'))
+    const name = basename(path)
+    for (const suffix of ['', '-wal', '-shm']) {
+      const source = join(dirname(path), `${name}${suffix}`)
+      if (existsSync(source)) copyFileSync(source, join(dir, `${name}${suffix}`))
+    }
+    const db = new DatabaseSync(join(dir, name), { readOnly: true })
+    return { db, dispose: () => { try { rmSync(dir!, { recursive: true, force: true }) } catch { /* best effort */ } } }
+  } catch {
+    if (dir !== undefined) { try { rmSync(dir, { recursive: true, force: true }) } catch { /* best effort */ } }
+    return undefined
+  }
 }
 
 /** Columns this reader depends on; missing ones degrade to the fallback path. */
@@ -74,10 +107,11 @@ function tableColumns(db: DatabaseSync, table: string): Set<string> {
  */
 export function readWorkBuddyCatalog(root: string): WorkBuddyCatalog {
   const path = join(root, 'workbuddy.db')
-  if (!existsSync(path)) return emptyCatalog()
-  let db: DatabaseSync | undefined
+  if (!existsSync(path)) return emptyCatalog('missing')
+  const opened = openCatalog(path)
+  if (opened === undefined) return emptyCatalog('unreadable')
+  const { db, dispose } = opened
   try {
-    db = new DatabaseSync(path, { readOnly: true })
     const sessions = new Map<string, WorkBuddySessionMetadata>()
     const deletedSessionIds = new Set<string>()
     const columns = tableColumns(db, 'sessions')
@@ -105,9 +139,10 @@ export function readWorkBuddyCatalog(root: string): WorkBuddyCatalog {
     } catch { /* older database without the table: leave the set empty */ }
     return { sessions, deletedSessionIds, liveWorkspacePaths, available: true }
   } catch {
-    return emptyCatalog()
+    return emptyCatalog('unreadable')
   } finally {
-    try { db?.close() } catch { /* best effort */ }
+    try { db.close() } catch { /* best effort */ }
+    dispose?.()
   }
 }
 

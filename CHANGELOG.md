@@ -1,5 +1,27 @@
 # 更新日志
 
+## v0.1.4 — 2026-11-11
+
+修复「在 WorkBuddy 里已经删除的对话仍然被导入」。
+
+两个原因：
+
+1. `migrate()` 只读 live metadata，**导入路径上从不复查 `deletedSessionIds`**；preview 过滤过的
+   删除会话仍可被显式选择或 `force` 导入。
+2. `workbuddy.db` 被运行中的 WorkBuddy 锁住时，`readWorkBuddyCatalog` 静默退化成空目录，
+   preview 看不到任何删除标记，把磁盘上残留的 JSONL 全当成可导入（当时的 manifest 里
+   `metadataHash` 全是 `hash(null)` 可以佐证）。
+
+修复：
+
+- 导入路径改用完整 catalog，并在转换前跳过 `deletedSessionIds`，`force` 也不例外。
+- 数据库打不开时先复制 `workbuddy.db`（含 `-wal`/`-shm`）到临时目录再读；仍然失败且文件存在时
+  返回 `available: false, unavailableReason: 'unreadable'`：preview 把这些会话标为不可导入并给出
+  警告，导入路径直接跳过会话（fail closed），不再在删除状态未知时猜测。
+- 新增测试：删除的会话即使 `force` 也不导入；损坏的数据库报告 `unreadable`。
+
+> 用旧版本导入过、且源端已删除的会话需要手动清理（或删除后重导）。
+
 ## v0.1.3 — 2026-11-11
 
 修复补上 `session/end-seed` 之后暴露的第二层不兼容：

@@ -14,7 +14,7 @@ import { parseMemoryCandidate, toMemoryRecords } from './memory.js'
 import { sanitizeMcpConfig } from './mcp.js'
 import { readWorkBuddyAutomations, resolveAutomationModel, toAutomationDraft, type AutomationDraft, type AutomationModelPolicy } from './automation.js'
 import { defaultWorkBuddyRoot, displayPath, probeWorkBuddy } from './probe.js'
-import { readWorkBuddyCatalog, readWorkBuddySessionMetadata, type WorkBuddySessionMetadata, type WorkBuddyMode } from './workbuddy-db.js'
+import { readWorkBuddyCatalog, type WorkBuddySessionMetadata, type WorkBuddyMode } from './workbuddy-db.js'
 import { replaceFile } from './atomic-file.js'
 
 interface WorkspaceLike {
@@ -311,6 +311,11 @@ export class MigrationService {
     const manifest = await this.state()
     const workbuddy = readWorkBuddyCatalog(source.sourceRoot)
     const catalog = workbuddy.sessions
+    // If the database exists but cannot be read, deletion state is unknown:
+    // importing transcripts would resurrect sessions the user deleted in
+    // WorkBuddy, so the preview fails closed instead of guessing.
+    const catalogUnreadable = !workbuddy.available && workbuddy.unavailableReason === 'unreadable'
+    if (catalogUnreadable) source.warnings.push({ code: 'workbuddy-catalog-unreadable', path: join(source.sourceRoot, 'workbuddy.db'), detail: 'workbuddy.db cannot be read, so deletion state is unknown; session import is disabled' })
     const sessions: MigrationPreview['sessions'] = []
     const excluded = { deletedSessions: 0, missingWorkspaces: 0 }
     for (const item of source.sessions) {
@@ -319,6 +324,10 @@ export class MigrationService {
         // must not be resurrected just because its transcript file remains.
         if (workbuddy.deletedSessionIds.has(item.sessionId)) {
           excluded.deletedSessions += 1
+          continue
+        }
+        if (catalogUnreadable) {
+          sessions.push({ path: item.path, sourceSessionId: item.sessionId, projectHash: item.projectHash, bytes: item.bytes, key: sourceKey(item, undefined, source.sourceRoot), status: 'failed', eligible: false, eventCount: 0, loss: [{ code: 'workbuddy-catalog-unreadable', detail: 'deletion state is unknown, so the transcript is not importable' }] })
           continue
         }
         const metadata = effectiveMetadata(item.path, source.sourceRoot, catalog)
@@ -443,7 +452,12 @@ export class MigrationService {
     const result: MigrationResult = { migrationFormatVersion: MIGRATION_FORMAT_VERSION, manifestId: randomUUID(), finishedAt: new Date().toISOString(), importedSessions: 0, skippedSessions: 0, importedMemories: 0, skippedMemories: 0, importedMcp: 0, skippedMcp: 0, importedAutomations: 0, skippedAutomations: 0, loss: [], errors: [] }
     try {
       const source = await this.probe()
-      const catalog = readWorkBuddySessionMetadata(source.sourceRoot)
+      const catalogState = readWorkBuddyCatalog(source.sourceRoot)
+      const catalog = catalogState.sessions
+      const catalogUnreadable = !catalogState.available && catalogState.unavailableReason === 'unreadable'
+      if (catalogUnreadable) {
+        result.loss.push({ code: 'workbuddy-catalog-unreadable', detail: 'workbuddy.db exists but could not be read; deletion state is unknown, so no sessions were imported' })
+      }
       const sessionWorkspacePath = sessionModeWorkspacePath()
       const batch: MigrationBatch = { id: result.manifestId, startedAt: result.finishedAt, status: 'running', selection, importedSessions: 0, skippedSessions: 0, importedMemories: 0, importedMcp: 0, errors: 0 }
       manifest.version = MIGRATION_FORMAT_VERSION
@@ -471,6 +485,13 @@ export class MigrationService {
         try {
           const metadata = effectiveMetadata(item.path, source.sourceRoot, catalog)
           const key = sourceKey(item, metadata, source.sourceRoot)
+          // Re-check here even though the preview filtered: an explicit force
+          // selection must not resurrect a session deleted in WorkBuddy.
+          if (catalogState.deletedSessionIds.has(item.sessionId) || catalogUnreadable) {
+            result.skippedSessions += 1
+            batch.skippedSessions += 1
+            continue
+          }
           if (hasFilter) {
             const cheapWorkspacePath = metadata?.mode === 'session' ? sessionWorkspacePath : (metadata?.cwd ?? projectWorkspacePath(item.projectHash))
             const cheapWid = workspaceIdOf(cheapWorkspacePath)

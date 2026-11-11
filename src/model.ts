@@ -11,6 +11,7 @@ export type ProbeWarningCode =
   | 'invalid-json'
   | 'unknown-event'
   | 'sqlite-header-only'
+  | 'workbuddy-catalog-unreadable'
   | 'read-failed'
 
 export interface ProbeWarning {

@@ -1,3 +1,4 @@
+import { DatabaseSync } from 'node:sqlite'
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -159,5 +160,41 @@ describe('MigrationService on-demand session selection', () => {
     expect(sanitizeSessionFilter(undefined, 'sessionKeys')).toEqual([])
     expect(() => sanitizeSessionFilter('nope', 'sessionKeys')).toThrow('must be an array')
     expect(() => sanitizeSessionFilter([''], 'sessionKeys')).toThrow('invalid entries')
+  })
+})
+
+describe('MigrationService deleted sessions', () => {
+  it('never imports a session WorkBuddy marks deleted, even with force', async () => {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-migration-deleted-'))
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-migration-deleted-target-'))
+    const project = join(sourceRoot, 'projects', 'p')
+    await mkdir(project, { recursive: true })
+    await writeFile(join(project, 'live.jsonl'), JSON.stringify({ type: 'message', role: 'user', content: 'live', timestamp: 1000 }))
+    await writeFile(join(project, 'gone.jsonl'), JSON.stringify({ type: 'message', role: 'user', content: 'gone', timestamp: 1000 }))
+
+    const db = new DatabaseSync(join(sourceRoot, 'workbuddy.db'))
+    db.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, custom_title TEXT, is_playground INTEGER, deleted_at INTEGER)')
+    db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)').run('live', null, 't', null, 1, null)
+    db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)').run('gone', null, 't', null, 1, 1735689600000)
+    db.close()
+
+    const created: string[] = []
+    const persistence = {
+      create: async (header: { id: string }) => { created.push(header.id) },
+      append: async () => undefined,
+    }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      const preview = await service.preview()
+      expect(preview.sessions.map(item => item.sourceSessionId)).toEqual(['live'])
+      const result = await service.migrate({ sessions: true, memories: false, mcp: false, force: true })
+      expect(result.importedSessions).toBe(1)
+      expect(created).toHaveLength(1)
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
   })
 })

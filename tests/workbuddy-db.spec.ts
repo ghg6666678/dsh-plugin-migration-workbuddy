@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
-import { mkdtemp, mkdir } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -22,7 +22,15 @@ describe('WorkBuddy catalog metadata', () => {
   it('degrades to an empty catalog for a missing or malformed database', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mwb-workbuddy-db-empty-'))
     expect(readWorkBuddySessionMetadata(root)).toEqual(new Map())
-    expect(readWorkBuddyCatalog(root)).toEqual({ sessions: new Map(), deletedSessionIds: new Set(), liveWorkspacePaths: new Set(), available: false })
+    expect(readWorkBuddyCatalog(root)).toEqual({ sessions: new Map(), deletedSessionIds: new Set(), liveWorkspacePaths: new Set(), available: false, unavailableReason: 'missing' })
+  })
+
+  it('reports an unreadable database instead of pretending nothing is deleted', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-workbuddy-db-broken-'))
+    await writeFile(join(root, 'workbuddy.db'), 'not a sqlite database')
+    const catalog = readWorkBuddyCatalog(root)
+    expect(catalog.available).toBe(false)
+    expect(catalog.unavailableReason).toBe('unreadable')
   })
 
   it('excludes sessions the user deleted in WorkBuddy and keeps the live workspace list', async () => {
