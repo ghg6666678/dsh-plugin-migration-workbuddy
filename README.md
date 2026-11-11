@@ -61,6 +61,10 @@ allowBuilds:
   还会继续报同一个错。
 - 键里带解析出的 tarball 地址和 commit SHA，所以它顺带起了**版本锁定**的作用；如果哪次打印出来的键
   跟上一次不同（git 解析方式变了），用最新那条。
+- 另外，pnpm ≥10 会在临时目录里给 git 依赖再跑一次 `pnpm install`。如果 `pnpm` 不在 PATH 上
+  （只装了 DSH 自带运行时、平时靠 corepack 的机器就是这样），这一步会报
+  `ERR_PNPM_PREPARE_PACKAGE` 和 `'pnpm' 不是内部或外部命令`。先 `npm i -g pnpm`（或
+  `corepack enable`）再重试；不想动环境就直接用上面的 Release tarball。
 
 这条授权等于**允许该包在安装时在你机器上执行代码**（在任何沙箱之外）。只对你信任源码的包这么做，
 并固定到 tag 或 commit。

@@ -67,6 +67,10 @@ Two things we measured, both easy to get wrong:
   (`dsh-plugin-migration-workbuddy: true`) does **not** work — the same error comes back.
 - The key embeds the resolved tarball URL and commit SHA, so it pins the version as a side effect. If
   a later attempt prints a different key (git resolution changed), use the newest one.
+- pnpm ≥10 also runs a nested `pnpm install` for a git dependency. If `pnpm` is not on PATH — the
+  usual case when DSH's bundled runtime is all you have — that step fails with
+  `ERR_PNPM_PREPARE_PACKAGE` and `'pnpm' is not recognized`. Run `npm i -g pnpm` (or
+  `corepack enable`) and retry, or just use the Release tarball above.
 
 That allowance is **permission to execute the package's code on your machine at install time**,
 outside any sandbox. Only allow packages whose source you trust, and pin a tag or commit.
