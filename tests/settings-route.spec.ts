@@ -43,7 +43,9 @@ function fakeRes() {
     statusCode: 0,
     headers: {} as Record<string, string>,
     setHeader: (key: string, value: string) => { res.headers[key] = value },
-    end: (value?: string) => { result.status = res.statusCode; result.body = value },
+    // `exactOptionalPropertyTypes` forbids assigning a possibly-undefined value
+    // to an optional field, and the handler may end the response with no body.
+    end: (value?: string) => { result.status = res.statusCode; if (value !== undefined) result.body = value },
   }
   return { res, result }
 }

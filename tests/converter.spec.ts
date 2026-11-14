@@ -249,4 +249,49 @@ describe('WorkBuddy converter context budget', () => {
     expect(turns.map(event => event.data?.turn)).toEqual(turns.map((_event, index) => index + 1))
     expect(events.some(event => event.type === 'system/message')).toBe(true)
   })
+
+  /**
+   * WorkBuddy replays a call/result pair when it retries, so one callId can
+   * appear twice in the transcript. A second `tool/result` for the same call
+   * leaves DSH's surface with more results than calls, and its compaction
+   * engine refuses to cut an unbalanced surface — an imported session then
+   * cannot be condensed and the whole transcript is rejected as too large.
+   */
+  it('emits one result per call even when WorkBuddy replays the pair', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-replay-'))
+    const project = join(root, 'projects', 'p')
+    await mkdir(project, { recursive: true })
+    const path = join(project, 'replay.jsonl')
+    const row = (type: string, extra: Record<string, unknown>): string => JSON.stringify({ type, timestamp: 1000, ...extra })
+    const pair = (id: string): string[] => [
+      row('function_call', { callId: id, name: 'read_file', arguments: '{"path":"a.txt"}' }),
+      row('function_call_result', { callId: id, status: 'completed', output: 'done' }),
+    ]
+    await writeFile(path, [
+      row('message', { role: 'user', content: 'go' }),
+      ...pair('call-1'),
+      ...pair('call-2'),
+      // The retry replays the first pair verbatim.
+      ...pair('call-1'),
+    ].join('\n'))
+
+    const converted = await convertWorkBuddySession(path, root)
+    const events = converted.events as Array<{ type?: string; data?: { message?: { toolCallId?: string; source?: { callId?: string }; content?: Array<{ type?: string }> } } }>
+    let balance = 0
+    let negative = 0
+    const resultIds = new Map<string, number>()
+    for (const event of events) {
+      if (event.type === 'assistant/message') {
+        for (const block of event.data?.message?.content ?? []) if (block.type === 'tool-call') balance += 1
+      } else if (event.type === 'tool/result') {
+        balance -= 1
+        if (balance < 0) negative += 1
+        const id = event.data?.message?.toolCallId ?? event.data?.message?.source?.callId ?? 'unknown'
+        resultIds.set(id, (resultIds.get(id) ?? 0) + 1)
+      }
+    }
+    expect(balance).toBeGreaterThanOrEqual(0)
+    expect(negative).toBe(0)
+    expect([...resultIds.values()].every(count => count === 1)).toBe(true)
+  })
 })

@@ -2,7 +2,12 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "rootDir": ".",
-    "noEmit": true
+    "noEmit": true,
+    // Client tests import the React settings section, so this project needs the
+    // same DOM lib the client build uses; without it every JSX input handler
+    // reports a missing `value`/`checked` property.
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx"
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "src/client/**/*.tsx", "tests/**/*.ts"]
 }

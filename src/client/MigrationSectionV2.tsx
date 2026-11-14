@@ -3,7 +3,7 @@ import type { MigrationApi } from './api.js'
 import { ImportPanel } from './ImportPanel.js'
 import { SECTION_CSS } from './section-css.js'
 
-export type MigrationSectionProps = PropsRuntime<'settings.section'> & PropsLocale<'migration.workbuddy'> & { api: MigrationApi }
+export type MigrationSectionProps = PropsRuntime<'settings.section'> & PropsLocale<'migration.workbuddy'> & { api: MigrationApi; refreshSessions?: () => void }
 
 /**
  * The migration settings section.
@@ -12,7 +12,7 @@ export type MigrationSectionProps = PropsRuntime<'settings.section'> & PropsLoca
  * DSH. The DSH -> WorkBuddy direction (export) is not part of this release, so
  * the section renders a single board with no tabs.
  */
-export function MigrationSection({ t, api }: MigrationSectionProps): React.ReactElement {
+export function MigrationSection({ t, api, refreshSessions }: MigrationSectionProps): React.ReactElement {
   return <section className="mwb-migration">
     <style>{SECTION_CSS}</style>
     <div className="mwb-migration-hero">
@@ -20,6 +20,6 @@ export function MigrationSection({ t, api }: MigrationSectionProps): React.React
       <h2>{t('title')}</h2>
       <p>{t('intro')}</p>
     </div>
-    <ImportPanel t={t} api={api} />
+    <ImportPanel t={t} api={api} {...(refreshSessions ? { refreshSessions } : {})} />
   </section>
 }

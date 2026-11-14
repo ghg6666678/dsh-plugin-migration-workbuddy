@@ -20,7 +20,7 @@ import { parseWorkBuddyInput } from './input-envelope.js'
  * every assistant round is one step carrying its tool calls and results —
  * instead of emitting one turn per WorkBuddy row.
  */
-export const MIGRATION_CONVERTER_VERSION = 9
+export const MIGRATION_CONVERTER_VERSION = 10
 
 export type ToolMode = 'transcript' | 'narrative'
 

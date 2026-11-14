@@ -5,7 +5,7 @@ import type { MigrationApi } from './api.js'
 import { SessionSelection } from './SessionSelection.js'
 import { AutomationSelection } from './AutomationSelection.js'
 
-export type ImportPanelProps = PropsLocale<'migration.workbuddy'> & { api: MigrationApi }
+export type ImportPanelProps = PropsLocale<'migration.workbuddy'> & { api: MigrationApi; refreshSessions?: () => void }
 
 /**
  * The WorkBuddy → DSH direction.
@@ -14,7 +14,7 @@ export type ImportPanelProps = PropsLocale<'migration.workbuddy'> & { api: Migra
  * would move, then writes only into DSH. That is why it needs no pre-flight quit
  * checklist — the export panel is the one that touches WorkBuddy's files.
  */
-export function ImportPanel({ t, api }: ImportPanelProps): React.ReactElement {
+export function ImportPanel({ t, api, refreshSessions }: ImportPanelProps): React.ReactElement {
   const [preview, setPreview] = useState<MigrationPreview>()
   const [result, setResult] = useState<MigrationResult>()
   const [selected, setSelected] = useState({ sessions: true, memories: true, mcp: true })
@@ -45,7 +45,7 @@ export function ImportPanel({ t, api }: ImportPanelProps): React.ReactElement {
     void api.settings()
       .then(value => {
         setLimitMib(String(Math.max(0, Math.round((value.maxFileBytes ?? 0) / (1024 * 1024)))))
-        setLimitTokens(String(Math.max(0, Math.round((value.maxContextTokens ?? 500_000) / 1000))))
+        setLimitTokens(String(Math.max(0, Math.round((value.maxContextTokens ?? 0) / 1000))))
       })
       .catch(() => undefined)
   }, [])
@@ -58,7 +58,7 @@ export function ImportPanel({ t, api }: ImportPanelProps): React.ReactElement {
       if (!Number.isFinite(mib) || !Number.isFinite(tokens)) throw new Error(t('settingsTitle'))
       const saved = await api.saveSettings({ maxFileBytes: mib * 1024 * 1024, maxContextTokens: tokens * 1000 })
       setLimitMib(String(Math.round((saved.maxFileBytes ?? 0) / (1024 * 1024))))
-      setLimitTokens(String(Math.round((saved.maxContextTokens ?? 500_000) / 1000)))
+      setLimitTokens(String(Math.round((saved.maxContextTokens ?? 0) / 1000)))
       refresh()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -80,7 +80,20 @@ export function ImportPanel({ t, api }: ImportPanelProps): React.ReactElement {
       : automationKeys.length < counts.automationEligible
         ? { automations: true as const, automationIds: automationKeys }
         : { automations: true as const }
-    try { const migrated = await api.run({ confirmed: true, memories: selected.memories, mcp: selected.mcp, ...sessionPayload, ...automationPayload }); setResult(migrated); refresh() } catch (cause) { setError(cause instanceof Error ? cause.message : t('runFailed')) } finally { setRunning(false) }
+    try {
+      const migrated = await api.run({ confirmed: true, memories: selected.memories, mcp: selected.mcp, ...sessionPayload, ...automationPayload })
+      setResult(migrated)
+      // Imported sessions are written straight to disk, so the Host never pushes
+      // them onto the (event-driven, never-polled) Session list. Ask the client
+      // to re-run session.list, which rescans the session directories, so the
+      // new conversations show up in the sidebar without restarting Harness.
+      if (migrated.importedSessions > 0) refreshSessions?.()
+      refresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t('runFailed'))
+    } finally {
+      setRunning(false)
+    }
   }
   const openManifest = async (): Promise<void> => {
     setManifestLoading(true); setManifestError(undefined)

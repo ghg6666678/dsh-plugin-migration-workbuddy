@@ -48,9 +48,15 @@ describe('MigrationService incremental imports', () => {
       expect(changed.importedSessions).toBe(1)
       expect(created).toHaveLength(2)
 
-      const manifest = JSON.parse(await readFile(service.manifestPath, 'utf8')) as { sessions: Array<{ archived?: boolean; status?: string }> }
-      expect(manifest.sessions.filter(item => item.archived !== true)).toHaveLength(1)
-      expect(manifest.sessions.filter(item => item.status === 'archived')).toHaveLength(1)
+      // The superseded import stays in the manifest as history, but it must never
+      // be marked archived: archiving the old entry is what previously removed
+      // the user's existing conversation from the DSH sidebar.
+      const manifest = JSON.parse(await readFile(service.manifestPath, 'utf8')) as { sessions: Array<{ archived?: boolean; status?: string; targetSessionId: string }> }
+      expect(manifest.sessions.filter(item => item.archived !== true)).toHaveLength(2)
+      expect(manifest.sessions.filter(item => item.status === 'archived')).toHaveLength(0)
+      expect(manifest.sessions[0]?.status).toBe('imported')
+      expect(manifest.sessions[1]?.status).toBe('imported')
+      expect(manifest.sessions[0]?.targetSessionId).not.toBe(manifest.sessions[1]?.targetSessionId)
     } finally {
       if (previous === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previous
@@ -282,6 +288,120 @@ describe('MigrationService settings', () => {
       await service.saveSettings({ maxFileBytes: 0 })
       expect((await service.preview()).sessions).toHaveLength(1)
       await expect(service.saveSettings({ maxFileBytes: -1 })).rejects.toThrow('non-negative integer')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+})
+
+describe('MigrationService context budget', () => {
+  /**
+   * Importing must reproduce the whole conversation by default.
+   *
+   * A configured budget used to be applied unconditionally and silently, which
+   * reduced a 77 MB / 21659-line WorkBuddy transcript to a handful of turns and
+   * replaced the rest with a summary. Nothing may trim unless the user asks.
+   */
+  async function writeLongSource(): Promise<string> {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-budget-source-'))
+    const project = join(sourceRoot, 'projects', 'p')
+    await mkdir(project, { recursive: true })
+    const lines = Array.from({ length: 40 }, (_, index) => JSON.stringify({ type: 'message', role: index % 2 === 0 ? 'user' : 'assistant', content: `turn-${String(index)} ${'x'.repeat(400)}`, cwd: sourceRoot, timestamp: 1000 + index }))
+    const path = join(project, 'long.jsonl')
+    await writeFile(path, `${lines.join('\n')}\n`)
+    return sourceRoot
+  }
+
+  it('keeps every turn when no budget is configured', async () => {
+    const sourceRoot = await writeLongSource()
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-budget-target-'))
+    const created: Array<{ id: string }> = []
+    const persistence = { create: async (header: { id: string }) => { created.push(header); return { append: async () => undefined, flush: async () => undefined, close: async () => undefined } }, append: async () => undefined }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      expect(await service.settings()).toEqual({})
+      const result = await service.migrate({ sessions: true, memories: false, mcp: false })
+      expect(result.importedSessions).toBe(1)
+      expect(result.loss.filter(item => item.code === 'context-trimmed')).toHaveLength(0)
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+
+  it('trims only when the user sets a budget, and reports it', async () => {
+    const sourceRoot = await writeLongSource()
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-budget-target-'))
+    const persistence = { create: async () => ({ append: async () => undefined, flush: async () => undefined, close: async () => undefined }), append: async () => undefined }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      await service.saveSettings({ maxContextTokens: 1000 })
+      const result = await service.migrate({ sessions: true, memories: false, mcp: false })
+      expect(result.importedSessions).toBe(1)
+      const trimmed = result.loss.filter(item => item.code === 'context-trimmed')
+      expect(trimmed).toHaveLength(1)
+      expect(trimmed[0]?.detail).toContain('set the budget to 0')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+})
+
+describe('MigrationService archive bookkeeping', () => {
+  /**
+   * `archiveSession()` reports refusal in its result object and never throws, so
+   * a refused archive must not be recorded as archived: the manifest would then
+   * claim a state the sidebar does not show. This pins the result check.
+   */
+  async function setupArchive(archiveSession: (id: string) => Promise<unknown>) {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-archive-source-'))
+    const project = join(sourceRoot, 'projects', 'p1')
+    await mkdir(project, { recursive: true })
+    await writeFile(join(project, 's.jsonl'), JSON.stringify({ type: 'message', role: 'user', content: 'hi', cwd: sourceRoot, timestamp: 1000 }))
+    const persistence = { create: async () => undefined, append: async () => undefined }
+    const workspaceRegistry = {
+      resolveByPath: async () => undefined,
+      create: async () => ({ id: 'ws-1', attachSession: async () => undefined }),
+      archiveSession,
+    }
+    const service = new MigrationService(persistence as never, workspaceRegistry as never, { sourceRoot })
+    await service.migrate({ sessions: true, memories: false, mcp: false })
+    return { service }
+  }
+
+  it('does not record an archive the workspace refused', async () => {
+    const refusals: string[] = []
+    const previous = process.env.DSH_HOME
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-archive-env-'))
+    process.env.DSH_HOME = targetRoot
+    try {
+      const { service } = await setupArchive(async (id: string) => { refusals.push(id); return { ok: false } })
+      const result = await service.archiveLastImport()
+      expect(refusals).toHaveLength(1)
+      expect(result).toEqual({ archived: 0, failed: 1 })
+      const manifest = JSON.parse(await readFile(service.manifestPath, 'utf8')) as { sessions: Array<{ archived?: boolean }> }
+      expect(manifest.sessions.some(item => item.archived === true)).toBe(false)
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+
+  it('records the archive when the workspace accepts it', async () => {
+    const previous = process.env.DSH_HOME
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-archive-env-'))
+    process.env.DSH_HOME = targetRoot
+    try {
+      const { service } = await setupArchive(async () => ({ ok: true }))
+      expect(await service.archiveLastImport()).toEqual({ archived: 1, failed: 0 })
+      const manifest = JSON.parse(await readFile(service.manifestPath, 'utf8')) as { sessions: Array<{ archived?: boolean }> }
+      expect(manifest.sessions.filter(item => item.archived === true)).toHaveLength(1)
     } finally {
       if (previous === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previous

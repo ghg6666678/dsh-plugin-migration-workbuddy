@@ -341,7 +341,10 @@ export class MigrationService {
 
   private async effectiveMaxContextTokens(): Promise<number> {
     const settings = await this.settings()
-    return settings.maxContextTokens ?? this.options.maxContextTokens ?? 500_000
+    // 0 (the default) disables trimming: an import must reproduce the whole
+    // conversation. A non-zero budget is an explicit opt-in that keeps only the
+    // newest turns, so it must never be applied by default.
+    return settings.maxContextTokens ?? this.options.maxContextTokens ?? 0
   }
 
   /** Migrated automations must not carry WorkBuddy model ids (unknown on the gateway). */
@@ -398,8 +401,8 @@ export class MigrationService {
         const key = sourceKey(item, metadata, source.sourceRoot)
         const known = [...manifest.sessions].reverse().find(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path))
         const repair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
-        // Metadata drift (title/cwd) must not force a re-import: that replaces
-        // the session and archives the old copy for no content change.
+        // Metadata drift (title/cwd) must not force a re-import: that writes a
+        // second copy of the same conversation for no content change.
         const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
         const status: MigrationPreview['sessions'][number]['status'] = known === undefined ? 'new' : repair ? 'repair' : changed ? 'changed' : 'unchanged'
         const workspaceId = workspaceIdOf(workspacePath)
@@ -562,10 +565,15 @@ export class MigrationService {
           }
           const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode() })
           if (contextBudget > 0) {
+            // `* 3` converts the token budget to a rough character budget
+            // (≈3 chars/token). Trimming is strictly opt-in: the default budget is
+            // 0, because dropping old turns here silently rewrote 77 MB
+            // transcripts down to a handful of turns and the user lost history
+            // they had already been reading in WorkBuddy.
             const trimmed = trimEventsToBudget(converted.events as SessionEvent[], contextBudget * 3)
             if (trimmed.droppedTurns > 0) {
               converted.events = trimmed.events
-              result.loss.push({ code: 'context-trimmed', detail: `${String(trimmed.droppedTurns)} earlier turn(s) omitted to fit the ${String(contextBudget)}-token context budget` })
+              result.loss.push({ code: 'context-trimmed', detail: `dropped the oldest ${String(trimmed.droppedTurns)} turn(s) to fit the ${String(contextBudget)}-token budget you configured; set the budget to 0 to import the whole conversation` })
             }
           }
           if (hasFilter) {
@@ -579,14 +587,13 @@ export class MigrationService {
           const needsRepair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
           const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
           if (known && selection.force !== true && !needsRepair && !changed) { result.skippedSessions += 1; batch.skippedSessions += 1; continue }
-          const targetId = known ? `${converted.targetSessionId}-${Date.now().toString(36)}` : converted.targetSessionId
-          if (known && this.workspaceRegistry) {
-            try {
-              await (this.workspaceRegistry as WorkspaceLike & { archiveSession?: (id: string) => Promise<void> }).archiveSession?.(known.targetSessionId)
-            } catch (cause) {
-              result.loss.push({ code: 'legacy-session-archive-failed', detail: cause instanceof Error ? cause.message : String(cause) })
-            }
-          }
+          // Re-importing a changed session must never archive, hide, or delete the
+          // copy already in DSH. Archiving it removed the user's existing
+          // conversation from the sidebar, which read as "import silently
+          // archived my chats". A stored log is immutable (persistence publishes
+          // with a no-overwrite publish), so a changed source is written under a
+          // fresh, derived id while the previous copy stays exactly as it was.
+          const targetId = known === undefined ? converted.targetSessionId : `${converted.targetSessionId}-${Date.now().toString(36)}`
           // Session-mode sessions always belong to the shared session-mode
           // workspace. The transcript may carry its own absolute `cwd` (newer
           // WorkBuddy builds stamp it on every row); using that here would
@@ -618,7 +625,10 @@ export class MigrationService {
               result.loss.push({ code: 'workspace-attach-failed', detail: cause instanceof Error ? cause.message : String(cause) })
             }
           }
-          if (known) { known.archived = true; known.status = 'archived'; known.supersededBy = targetId }
+          // The previous manifest entry stays as import history. It is NOT marked
+          // archived: the `known` lookup below walks newest-first, so the entry
+          // pushed here wins on the next preview/import, and leaving the older row
+          // unarchived keeps the audit trail readable instead of rewriting it.
           manifest.sessions.push({ toolMode: this.toolMode(), sourceHash: converted.sourceHash, sourcePath: converted.sourcePath, sourceSessionId: converted.sourceSessionId, sourceKey: key, metadataHash: metadataHash(metadata), targetSessionId: targetId, importId: result.manifestId, converterVersion: MIGRATION_CONVERTER_VERSION, lastImportedAt: new Date().toISOString(), status: 'imported', ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}) })
           result.importedSessions += 1; batch.importedSessions += 1; result.loss.push(...converted.loss)
           await atomicJson(this.manifestPath, manifest)
@@ -703,17 +713,29 @@ export class MigrationService {
     } finally { this.running = false }
   }
 
-  async archiveLastImport(manifestId?: string): Promise<{ archived: number }> {
+  async archiveLastImport(manifestId?: string): Promise<{ archived: number; failed: number }> {
     void manifestId
     const manifest = await this.state()
     let archived = 0
+    let failed = 0
     for (const entry of manifest.sessions) {
       if (entry.archived === true || (manifestId !== undefined && entry.importId !== manifestId)) continue
-      if (this.workspaceRegistry) { try { await (this.workspaceRegistry as WorkspaceLike & { archiveSession?: (id: string) => Promise<void> }).archiveSession?.(entry.targetSessionId) } catch { /* retain manifest audit even when archive is unavailable */ } }
+      // archiveSession() reports failure through its return value instead of
+      // throwing, so read the result: a silently refused archive must not be
+      // recorded as archived, or the manifest claims a state the sidebar does
+      // not show.
+      let ok = true
+      if (this.workspaceRegistry) {
+        try {
+          const result = await (this.workspaceRegistry as WorkspaceLike & { archiveSession?: (id: string) => Promise<unknown> }).archiveSession?.(entry.targetSessionId) as { ok?: boolean } | undefined
+          if (result !== undefined && result.ok === false) ok = false
+        } catch { ok = false }
+      }
+      if (!ok) { failed += 1; continue }
       entry.archived = true; archived += 1
     }
     await atomicJson(this.manifestPath, manifest)
-    return { archived }
+    return { archived, failed }
   }
 
   async setMemoryEnabled(id: string, enabled: boolean): Promise<MemoryRecord | undefined> {
