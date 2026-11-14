@@ -2,10 +2,6 @@ import { describe, expect, it } from 'vitest'
 import { apply, inject, name } from '../src/index.js'
 import {
   MIGRATION_ARCHIVE_PATH,
-  MIGRATION_EXPORT_HISTORY_PATH,
-  MIGRATION_EXPORT_PREVIEW_PATH,
-  MIGRATION_EXPORT_RUN_PATH,
-  MIGRATION_EXPORT_UNDO_PATH,
   MIGRATION_MANIFEST_PATH,
   MIGRATION_MEMORY_DELETE_PATH,
   MIGRATION_MEMORY_UPDATE_PATH,
@@ -53,10 +49,6 @@ describe('plugin mount', () => {
     apply(context as never, { enabled: true })
     expect(routes.map(route => route.path).sort()).toEqual([
       MIGRATION_ARCHIVE_PATH,
-      MIGRATION_EXPORT_HISTORY_PATH,
-      MIGRATION_EXPORT_PREVIEW_PATH,
-      MIGRATION_EXPORT_RUN_PATH,
-      MIGRATION_EXPORT_UNDO_PATH,
       MIGRATION_MANIFEST_PATH,
       MIGRATION_MEMORY_DELETE_PATH,
       MIGRATION_MEMORY_UPDATE_PATH,
@@ -78,7 +70,7 @@ describe('plugin mount', () => {
     // channel is an optional integration rather than a dependency.
     expect(() => { apply(context as never, undefined) }).not.toThrow()
     // Eight import routes (including /settings) plus four export routes.
-    expect(routes).toHaveLength(12)
+    expect(routes).toHaveLength(8)
   })
 
   it('mounts with a rule-import channel', () => {

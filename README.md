@@ -1,14 +1,14 @@
-﻿# dsh-plugin-migration-workbuddy
+# dsh-plugin-migration-workbuddy
 
 把 WorkBuddy 的会话、记忆、MCP 配置与自动化任务迁移进 DSH。
 
-插件开箱可用，设置页分成两个板块：
+插件开箱可用，设置页只有一个板块：
 
 - **导入数据**（WorkBuddy → DSH）：**扫描 → 预览 → 明确确认 → 导入 → 审计清单** 的完整闭环，
   打开页面只做本机**只读**扫描，不会复制、移动或修改任何 WorkBuddy 数据。
-- **导出数据**（DSH → WorkBuddy）：会话按水位线只追加新增内容，记忆 / MCP / 定时任务三块也各有
-  对应的导出板块；写入前要求完全退出 WorkBuddy。
 
+> 本发行版（0.2.5）**只带导入方向**，不含 DSH → WorkBuddy 的导出功能。
+> 需要导出请使用 0.4.x 系列。
 ## 兼容性
 
 本分支适配 DSH **0.2.x**（实测 `0.2.2-rc.1`），最低版本写在 `package.json` 的 `engines.dsh`
@@ -27,28 +27,10 @@
 另外补上了新版 WorkBuddy 会话事件的识别（`session-meta`、`resend-fork-notice`、`credit-usage`），
 并修了会话/自动化卡片勾选与「全选」的交互。
 
-**v0.4.3** 把设置页拆成「导入数据」与「导出数据」两个板块，并新增 DSH → WorkBuddy 的导出方向
-（详见下面的「导出数据」一节）。
-
-**v0.4.4** 修掉「明明还有新对话，导出板块却说没有需要导出的内容」：DSH 0.2.x 的会话后端不再提供
-`inspect()`，`list()` 也改成返回带 `header` 的快照对象，导出侧读不到事件、会话 id 还变成了字符串
-`"undefined"`，于是所有会话都显示成空。现在改成按能力探测（`inspect` → `open/read` → `load`），
-并兼容两种 `list()` 返回形状。
-
-**v0.4.5** 补上导出方向缺的三块（记忆 / MCP / 定时任务），导入有什么导出就有什么；同时修掉「精确选择
-会话」弹窗左侧目录栏过宽、右侧内容被挤没了的问题（分栏改为按面板自身宽度自适应的容器查询）。
-
-**v0.4.6** 修掉记忆导入读错文件：旧版只扫 `~/.workbuddy/memory/`，而那里只有每账号的档案脚手架
-（`> Version: 0`、`RAW_JSON_START`、`"memoryBlock": ""`），真正的记忆在根目录的 `MEMORY.md`，
-从来没被读过。结果「导入了 20 条记忆」其实是 20 行 JSON 括号，导出侧自然一条可用内容都挑不出来。
-现在把 `MEMORY.md` 纳入扫描，并滤掉 YAML 头、`RAW_JSON` 块、`key: value` 元数据这类无实质内容的行；
-另外每次记忆导入会自动清掉旧版残留的脚手架记录，不用手工改 `manifest.json`。
-
-**v0.4.7** 修掉「保存上下文预算报 not found」：`/api/migration/workbuddy/settings` 的 GET/POST
-处理逻辑一直都在，但它被漏写在路由注册数组里，请求落到 DSH 基座的兜底鉴权层返回
-401 unauthorized，前端就显示成保存失败。现在把 settings 补进注册清单，并按方法区分读写
-（GET 不需要自定义标记头、POST 需要），同时补上真正调用 handler 的回归测试 —— 旧测试只数
-路由数量，而那份数量清单本身也漏了 settings，所以 187 项全绿却没抓到。
+**v0.2.5** 是只保留导入方向的发行版：在 0.4.7 的导入代码基础上，去掉导出服务、导出板块、
+WorkBuddy 进程探测与导出面板，路由从 12 条收敛到 8 条，设置区块合并为单一导入面板。
+导入侧的修复全部保留：根目录 `MEMORY.md` 识别、脚手架记录清理、`settings` 路由注册、
+上下文预算、记忆摘要来源类型、元数据漂移判定等。
 
 ## 安装
 
@@ -59,7 +41,7 @@
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.7/dsh-plugin-migration-workbuddy-0.4.7.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.2.5/dsh-plugin-migration-workbuddy-0.2.5.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -68,7 +50,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.7
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.2.5
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从
@@ -134,7 +116,6 @@ dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
 | `maxContextTokens` | `500000` | 单个导入会话的上下文预算（估算 token）；超出时从最早的 turn 开始丢弃，只保留最近轮次；`0` = 不裁剪。也可在设置页调整 |
 | `automationModelId` | `''` | 迁移的自动化规则写死的模型 id；空 = 用部署默认模型 |
 | `automationModelAllowlist` | `[]` | 允许原样透传的模型 id；其余按 `automationModelId` 改写并记 `automation-model-remapped` |
-| `workbuddyRoot` | `''` | 导出目标根目录；空 = 用 `$WORKBUDDY_HOME`，否则 `~/.workbuddy` |
 
 源目录取 `$WORKBUDDY_HOME`，否则 `~/.workbuddy`；目标取 `$DSH_HOME`，否则 `~/.dsh`。
 
@@ -172,65 +153,6 @@ dsh plugin --profile <name> add dsh-plugin-migration-workbuddy
 规则落库通过部署注册的通道完成（服务名 `automationImport`；部分部署还会注册一个兼容通道名）。
 **没有通道也能用**：预览照常列出自动化草稿，但标记为不可导入；显式导入时跳过并记
 `automation-channel-unavailable`，不会让整批迁移失败。会话、记忆、MCP 不受影响。
-
-## 导出数据（DSH → WorkBuddy）
-
-设置页的第二个板块把 DSH 会话写回 WorkBuddy，方向与上面完全相反。设计前提是**两边的历史都不许丢**，
-所以默认行为是**只追加，不覆盖**。
-
-- **水位线**：每个会话在 `$DSH_HOME/migration/export.json` 里记一条 `lastSyncedEventSeq`。
-  只有该 seq 之后的新事件会被写成新的 JSONL 行，已经导出的部分永不重写。
-- **状态判定**（每次打开面板都会重新读转录尾部）：
-
-  | 状态 | 含义 | 默认动作 |
-  | --- | --- | --- |
-  | `new` | 没导出过；或 WorkBuddy 里的转录文件已不存在 | 新建 WorkBuddy 会话 |
-  | `ahead` | DSH 有新内容，WorkBuddy 没动过 | 追加到原会话 |
-  | `synced` | 水位线追平 | 跳过 |
-  | `workbuddy-ahead` | 只在 WorkBuddy 那边继续过 | **不写**，提示用「导入数据」把新内容带回来 |
-  | `conflict` | 两边都动了 | 新建一个 WorkBuddy 会话，两边记录都留着 |
-
-  `workbuddy-ahead` 单独成一档是刻意的：此时往原会话追加会让 WorkBuddy 那段续写错位，而新建
-  会话又会在 WorkBuddy 侧留下两个分支，所以正确做法是先把 WorkBuddy 的新内容导回来。
-- **必须是完全退出的 WorkBuddy**：写入前先枚举 `\\.\pipe\*` 里匹配 `workbuddy|codebuddy` 的命名管道
-  （这是本机唯一可靠的存活信号，`-wal` mtime 与 `CreateFileW` 独占探测在实测中都会误判），
-  并要求用户在对话框里勾选「所有会话都已执行完毕，WorkBuddy 已完全退出」。探测本身跑不起来时
-  **直接中止**（fail closed），不提供「跳过检查」。
-- **写入**：先备份 `workbuddy.db`，再用临时文件 + 原子替换落盘；JSONL 行按 `parentId` 串成链，
-  时间戳严格单调递增（源端闲置过的会话不会产生排在父行之前的行）。会话模式导出会同时 upsert
-  `workspaces.path`，否则新转录不会出现在 WorkBuddy 侧边栏。
-- **撤销**：每次导出记一条批次（行偏移、DB 影响、新建的会话 id），「撤销上一次导出」按偏移截断
-  追加内容并回收新建的会话；已追加的内容被截断后水位线保留，下次导出会重新追加那段。
-
-### 记忆、MCP 与定时任务（导出方向）
-
-「导入数据」有的三类内容，「导出数据」也有对应的三块，各自独立勾选：
-
-| 板块 | 写入位置 | 冲突策略 |
-| --- | --- | --- |
-| 记忆 | `~/.workbuddy/MEMORY.md` 里带 `<!-- dsh-migration:begin/end -->` 标记的区块 | 只替换这个区块，你自己写的章节一字不动 |
-| MCP | `~/.workbuddy/mcp.json` 的 `mcpServers` | 同名条目保持原样，状态显示「冲突」，绝不覆盖 |
-| 定时任务 | `workbuddy.db` 的 `automations` 表 | 同名自动化视为已存在，跳过 |
-
-写这三块之前都会先备份目标文件（`MEMORY.md.dsh-backup-<批次>`、`mcp.json.dsh-backup-<批次>`、
-`workbuddy.db`），「撤销上一次导出」会把它们连同会话一起还原。
-
-有几个必须知道的边界：
-
-- **凭据永远不复制**。MCP 的 `env` / `headers` 只记录**键名**，值在解析阶段就丢掉了。因此带凭据的
-  server 会写成 `"disabled": true`，导完需要你在 WorkBuddy 里重新填 Token 再启用 —— 这是刻意的，
-  一个缺凭据还处于启用状态的 server 只会不断报错。
-- **记忆先过一遍噪声过滤**。导入侧写入的记录里有很多只有结构标记的行（`---`、
-  `<!-- RAW_JSON_START -->`、`"memoryBlock": ""`、`> Version: 0` 之类），这些不导出，
-  面板会明确写出「已跳过 N 条只是结构标记的记录」。你本机的情况是 30 条全部属于这一类：
-  WorkBuddy 自己的 `memoryBlock` 就是空的，所以**记忆板块显示 0 条待导出是正确结果**，不是漏读。
-- **定时任务只转 RRULE**。`daily` / `weekly` / `rrule` / `at` 能等价映射；`cron` 没有等价形式，
-  `every` / `after`（固定间隔、延时）WorkBuddy 根本不支持，这三种会标成「无法转换」并跳过，
-  需要你在 WorkBuddy 里手动新建。
-- **DSH 没有可枚举的 MCP / 定时任务注册表**。所以这两块读的是 DSH 真实落盘的东西：profile 与
-  bundle 里挂载 `@deepseek-ai/dsh-mcp-client` 的 `cordis.patch.yml`（`serverName` / `transport` /
-  `command` / `url`，跳过被注释掉的条目），以及 `schedule` 服务暴露的 `list()`。哪一样不存在，
-  对应板块就显示「没有可导出的内容」，而不是编造数据。
 
 ## 安全边界
 

@@ -2,15 +2,14 @@
 
 Migrate WorkBuddy sessions, memories, MCP drafts, and automation tasks into DSH.
 
-The plugin works out of the box and splits the settings page into two boards:
+The plugin works out of the box and has a single settings board:
 
-- **Import data** (WorkBuddy → DSH): **scan → preview → explicit confirmation → import → auditable
-  manifest**. Opening the page performs only a local **read-only** scan; it never copies, moves, or
-  modifies WorkBuddy data.
-- **Export data** (DSH → WorkBuddy): appends only what is new since a per-session watermark, offers the
-  matching memories / MCP / scheduled-task boards, and refuses to write until WorkBuddy has fully
-  exited.
+- **Import data** (WorkBuddy → DSH): the full **scan → preview → explicit confirm → import → audit**
+  loop. Opening the page only performs a **read-only** scan of local files; it never copies, moves,
+  or modifies any WorkBuddy data.
 
+> This release (0.2.5) ships the **import direction only**; it has no DSH → WorkBuddy export.
+> Use a 0.4.x build if you need export.
 ## Compatibility
 
 This branch targets DSH **0.2.x** (verified against `0.2.2-rc.1`). The minimum is declared in
@@ -33,16 +32,11 @@ Compared with v0.1.0, v0.1.1 fixes four incompatibilities with the current clien
 It also recognizes newer WorkBuddy session events (`session-meta`, `resend-fork-notice`,
 `credit-usage`) and fixes checkbox/select-all interaction on the session and automation cards.
 
-**v0.4.3** splits the settings page into "Import data" and "Export data" boards and adds the
-DSH → WorkBuddy export direction (see the export section below).
-
-**v0.4.4** fixes "the export board says there is nothing to export although the session clearly has new turns": the DSH 0.2.x session backends no longer expose `inspect()`, and `list()` now returns snapshots that nest the header. The export side therefore failed to read any events and every session id stringified to `"undefined"`, so all sessions rendered as empty. Reads now probe capabilities (`inspect` → `open/read` → `load`) and accept either `list()` shape.
-
-**v0.4.5** adds the three boards the export direction was missing (memories / MCP / scheduled tasks), so the export side mirrors import one for one, and fixes the "select sessions precisely" dialog whose left workspace column was so wide the right pane was squeezed out of sight (the split now adapts to the panel's own width via a container query).
-
-**v0.4.6** fixes memory import reading the wrong file: older builds scanned only `~/.workbuddy/memory/`, which holds nothing but the per-account profile scaffolding (`> Version: 0`, `RAW_JSON_START`, `"memoryBlock": ""`), while the curated notes live in the root `MEMORY.md` and were never read. "Imported 20 memories" was really 20 lines of JSON braces, so the export board could not pick out a single usable item. `MEMORY.md` is now scanned and scaffolding lines (YAML headers, `RAW_JSON` blocks, `key: value` metadata) are filtered out; every memory import also drops the scaffolding rows older builds stored, so no hand-editing of `manifest.json` is needed.
-
-**v0.4.7** fixes "saving the context budget fails with not found": the `/api/migration/workbuddy/settings` GET/POST handler was always present, but the path was missing from the route registration array, so requests fell through to the DSH host's catch-all auth layer and returned 401 unauthorized, which the UI surfaced as a save failure. Settings is now registered, reads and writes are distinguished by method (GET needs no marker header, POST does), and a handler-level regression test was added — the old test only counted routes, and its own expected list omitted settings too, which is why 187 green tests never caught this.
+**v0.2.5** is the import-only release: on top of the 0.4.7 import code it removes the export service,
+the export boards, the WorkBuddy process probe and the export panel, shrinks the route table from 12 to
+8 endpoints, and merges the settings section into a single import panel. Every import-side fix is kept:
+root `MEMORY.md` discovery, scaffolding-record pruning, `settings` route registration, the context
+budget, the memory-summary source kind, and the metadata-drift check.
 
 ## Install
 
@@ -54,7 +48,7 @@ hand-written composition row needed.
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.7/dsh-plugin-migration-workbuddy-0.4.7.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.2.5/dsh-plugin-migration-workbuddy-0.2.5.tgz
 ```
 
 The tarball already contains a built `lib/`: measured at **one command, ~3 seconds, exit 0**, with no
@@ -63,7 +57,7 @@ The tarball already contains a built `lib/`: measured at **one command, ~3 secon
 ### From GitHub by tag (needs a build permission)
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.7
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.2.5
 ```
 
 A git install fetches **sources, not built artifacts**, so this package ships a `prepare` script that
@@ -181,74 +175,6 @@ Rules are persisted through whichever channel the deployment registers (the serv
 usable without one**: the preview still lists automation drafts but marks them ineligible, and an
 explicit automation import skips them with an `automation-channel-unavailable` loss instead of
 failing the batch. Sessions, memories, and MCP are unaffected.
-
-## Export data (DSH → WorkBuddy)
-
-The second board writes DSH sessions back into WorkBuddy — the exact opposite direction. It is built
-around one rule: **neither side's history may be lost**, so the default is append-only.
-
-- **Watermark**: every session records a `lastSyncedEventSeq` in
-  `$DSH_HOME/migration/export.json`. Only events after that seq become new JSONL rows; what was
-  already exported is never rewritten.
-- **Status** (recomputed from the transcript tail every time the board opens):
-
-  | Status | Meaning | Default action |
-  | --- | --- | --- |
-  | `new` | never exported, or the WorkBuddy transcript is gone | create a WorkBuddy session |
-  | `ahead` | DSH moved on, WorkBuddy did not | append to the original |
-  | `synced` | watermark caught up | skip |
-  | `workbuddy-ahead` | only WorkBuddy moved on | **write nothing**; point at "Import data" |
-  | `conflict` | both sides moved on | create a new WorkBuddy session, keeping both |
-
-  `workbuddy-ahead` is a separate state on purpose: appending there would misplace WorkBuddy's own
-  continuation, while creating a session would fork the history on the WorkBuddy side. Pulling the
-  new part back through the import board is the only lossless option.
-- **WorkBuddy must be fully quit**: before writing, the plugin enumerates `\\.\pipe\*` for
-  `workbuddy|codebuddy` named pipes (the only reliable liveness signal on this machine — `-wal` mtime
-  and `CreateFileW` share probes both produced false results in testing) and requires the user to
-  tick "all conversations finished, WorkBuddy fully quit". If the probe itself cannot run, export
-  **fails closed**; there is no "skip the check" escape hatch.
-- **Writes**: `workbuddy.db` is backed up first, then files go through temp-file + atomic replace.
-  JSONL rows are chained by `parentId` with strictly increasing timestamps, so a session that sat
-  idle never emits a row that sorts before its parent. Session-mode exports also upsert
-  `workspaces.path`, without which the new transcript never appears in WorkBuddy's sidebar.
-- **Undo**: each export records a batch (row offsets, DB effects, created session ids). "Undo the last
-  export" truncates the appended rows and reclaims created sessions. Truncation keeps the watermark,
-  so the next export appends that stretch again.
-
-### Memories, MCP and scheduled tasks (export side)
-
-Everything "Import data" can carry has a counterpart on the export board, each selected independently:
-
-| Board | Destination | Conflict policy |
-| --- | --- | --- |
-| Memories | A block delimited by `<!-- dsh-migration:begin/end -->` inside `~/.workbuddy/MEMORY.md` | Only that block is replaced; your own sections are never touched |
-| MCP | `mcpServers` in `~/.workbuddy/mcp.json` | An existing name is left exactly as it is and reported as a conflict |
-| Scheduled tasks | The `automations` table in `workbuddy.db` | An automation with the same name counts as present and is skipped |
-
-Each target is backed up before it is written (`MEMORY.md.dsh-backup-<batch>`,
-`mcp.json.dsh-backup-<batch>`, `workbuddy.db`), and "Undo the last export" restores them together with
-the sessions.
-
-Three boundaries are worth knowing up front:
-
-- **Credentials are never copied.** For MCP only the `env` / `headers` **key names** are kept; the
-  values are dropped during parsing. A server that needs them is written `"disabled": true`, and you
-  re-enter the token in WorkBuddy before enabling it — a server that is enabled but missing its
-  credentials would just fail on every call.
-- **Memories are filtered first.** The records the import wrote include many lines that are nothing but
-  structural markers (`---`, `<!-- RAW_JSON_START -->`, `"memoryBlock": ""`, `> Version: 0`). Those are
-  not exported, and the panel says how many were skipped. On this machine all 30 are of that kind —
-  WorkBuddy's own `memoryBlock` is empty — so **0 pending memories is the correct answer**, not a
-  read failure.
-- **Scheduled tasks only translate to RRULE.** `daily` / `weekly` / `rrule` / `at` map exactly; `cron`
-  has no equivalent, and `every` / `after` (fixed interval, delayed) do not exist in WorkBuddy at all.
-  Those are marked "cannot convert" and skipped, so create them by hand.
-- **DSH has no enumerable MCP or schedule registry.** Both boards therefore read what DSH really
-  persists: the `cordis.patch.yml` files in profiles and bundles that mount
-  `@deepseek-ai/dsh-mcp-client` (`serverName` / `transport` / `command` / `url`, with commented-out
-  entries ignored), plus the `list()` surface of the `schedule` service. When neither exists the board
-  says there is nothing to export instead of inventing data.
 
 ## Security boundaries
 
