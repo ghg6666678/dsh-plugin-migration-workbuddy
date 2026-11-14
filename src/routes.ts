@@ -157,12 +157,18 @@ function redactExportPreview(value: Awaited<ReturnType<ExportService['preview']>
 }
 
 export function registerMigrationRoutes(webserver: WebServer, config: MigrationConfig, service: MigrationService): () => void {
-  const paths = [MIGRATION_PROBE_PATH, MIGRATION_PREVIEW_PATH, MIGRATION_RUN_PATH, MIGRATION_MANIFEST_PATH, MIGRATION_ARCHIVE_PATH, MIGRATION_MEMORY_UPDATE_PATH, MIGRATION_MEMORY_DELETE_PATH]
+  const paths = [MIGRATION_PROBE_PATH, MIGRATION_PREVIEW_PATH, MIGRATION_RUN_PATH, MIGRATION_MANIFEST_PATH, MIGRATION_SETTINGS_PATH, MIGRATION_ARCHIVE_PATH, MIGRATION_MEMORY_UPDATE_PATH, MIGRATION_MEMORY_DELETE_PATH]
   const routes = paths.map(path => webserver.register({
     kind: 'exact' as const,
     path,
     handler: async (req, res) => {
-      const mutating = path !== MIGRATION_PROBE_PATH && path !== MIGRATION_PREVIEW_PATH && path !== MIGRATION_MANIFEST_PATH
+      // Only writes need the marker. Settings has both a GET and a POST, so a
+      // blanket "everything but probe/preview/manifest is mutating" would
+      // wrongly demand the marker on the settings read as well.
+      const read = path === MIGRATION_PROBE_PATH || path === MIGRATION_PREVIEW_PATH
+        || path === MIGRATION_MANIFEST_PATH
+        || (path === MIGRATION_SETTINGS_PATH && req.method === 'GET')
+      const mutating = !read
       if (!sameOrigin(req, mutating, webserver.port)) { sendJson(res, 403, { error: 'loopback same-origin request required' }); return }
       try {
         if (path === MIGRATION_PROBE_PATH || path === MIGRATION_PREVIEW_PATH) {

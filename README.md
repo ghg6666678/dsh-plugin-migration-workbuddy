@@ -44,6 +44,12 @@
 现在把 `MEMORY.md` 纳入扫描，并滤掉 YAML 头、`RAW_JSON` 块、`key: value` 元数据这类无实质内容的行；
 另外每次记忆导入会自动清掉旧版残留的脚手架记录，不用手工改 `manifest.json`。
 
+**v0.4.7** 修掉「保存上下文预算报 not found」：`/api/migration/workbuddy/settings` 的 GET/POST
+处理逻辑一直都在，但它被漏写在路由注册数组里，请求落到 DSH 基座的兜底鉴权层返回
+401 unauthorized，前端就显示成保存失败。现在把 settings 补进注册清单，并按方法区分读写
+（GET 不需要自定义标记头、POST 需要），同时补上真正调用 handler 的回归测试 —— 旧测试只数
+路由数量，而那份数量清单本身也漏了 settings，所以 187 项全绿却没抓到。
+
 ## 安装
 
 本包自带 `cordis.patch.yml`，并通过 `dsh.bundle.patch` 声明自己是 profile bundle：`dsh plugin add`
@@ -53,7 +59,7 @@
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.6/dsh-plugin-migration-workbuddy-0.4.6.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.7/dsh-plugin-migration-workbuddy-0.4.7.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -62,7 +68,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.6
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.7
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从

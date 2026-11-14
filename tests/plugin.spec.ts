@@ -12,6 +12,7 @@ import {
   MIGRATION_PREVIEW_PATH,
   MIGRATION_PROBE_PATH,
   MIGRATION_RUN_PATH,
+  MIGRATION_SETTINGS_PATH,
 } from '../src/routes.js'
 
 interface RegisteredRoute {
@@ -62,6 +63,7 @@ describe('plugin mount', () => {
       MIGRATION_PREVIEW_PATH,
       MIGRATION_PROBE_PATH,
       MIGRATION_RUN_PATH,
+      MIGRATION_SETTINGS_PATH,
     ].sort())
     // Routes are namespaced to this plugin, never to a host product surface.
     expect(routes.every(route => route.path.startsWith('/api/migration/workbuddy/'))).toBe(true)
@@ -75,8 +77,8 @@ describe('plugin mount', () => {
     // No channel registered anywhere: mounting must still succeed, because the
     // channel is an optional integration rather than a dependency.
     expect(() => { apply(context as never, undefined) }).not.toThrow()
-    // Seven import routes plus four export routes.
-    expect(routes).toHaveLength(11)
+    // Eight import routes (including /settings) plus four export routes.
+    expect(routes).toHaveLength(12)
   })
 
   it('mounts with a rule-import channel', () => {
