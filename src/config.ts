@@ -6,6 +6,14 @@ export interface MigrationConfig {
   maxFileBytes: number
   /** Estimated context-token budget for one imported seed; 0 = keep everything. */
   maxContextTokens: number
+  /**
+   * Whether an imported WorkBuddy summary becomes a DSH checkpoint.
+   *
+   * 'auto' (default) folds only when the session is too large to continue
+   * as-is; 'always' folds whenever WorkBuddy wrote a summary; 'never' imports
+   * the transcript untouched.
+   */
+  summaryMode: 'auto' | 'always' | 'never'
   maxFiles: number
   /**
    * 'narrative' (default): flatten tool calls/results into plain text so an
@@ -35,7 +43,8 @@ export interface MigrationConfig {
 export const Config: z<MigrationConfig> = z.object({
   enabled: z.boolean().default(true),
   maxFileBytes: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(0),
-  maxContextTokens: z.number().step(1).min(0).max(10_000_000).default(500_000),
+  maxContextTokens: z.number().step(1).min(0).max(10_000_000).default(0),
+  summaryMode: (z.union(['auto', 'always', 'never'] as const)).default('auto'),
   maxFiles: z.number().step(1).min(1).max(100_000).default(5_000),
   toolMode: (z.union(['transcript', 'narrative'] as const)).default('transcript'),
   automationModelId: z.string().default(''),
@@ -47,7 +56,8 @@ export function normalizeMigrationConfig(raw: Partial<MigrationConfig> | undefin
   return {
     enabled: raw?.enabled ?? true,
     maxFileBytes: Math.max(0, raw?.maxFileBytes ?? 0),
-    maxContextTokens: Math.max(0, raw?.maxContextTokens ?? 500_000),
+    maxContextTokens: Math.max(0, raw?.maxContextTokens ?? 0),
+    summaryMode: raw?.summaryMode === 'always' || raw?.summaryMode === 'never' ? raw.summaryMode : 'auto',
     maxFiles: raw?.maxFiles ?? 5_000,
     toolMode: raw?.toolMode === 'narrative' ? 'narrative' : 'transcript',
     automationModelId: raw?.automationModelId?.trim() ?? '',

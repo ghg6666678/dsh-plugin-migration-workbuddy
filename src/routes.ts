@@ -146,7 +146,7 @@ export function registerMigrationRoutes(webserver: WebServer, config: MigrationC
           if (req.method === 'GET') { sendJson(res, 200, await service.settings()); return }
           if (req.method === 'POST') {
             const input = await body(req)
-            const patch: { maxFileBytes?: number; maxContextTokens?: number } = {}
+            const patch: { maxFileBytes?: number; maxContextTokens?: number; summaryMode?: 'auto' | 'always' | 'never' } = {}
             for (const key of ['maxFileBytes', 'maxContextTokens'] as const) {
               if (input[key] === undefined) continue
               const value = input[key]
@@ -154,6 +154,13 @@ export function registerMigrationRoutes(webserver: WebServer, config: MigrationC
                 sendJson(res, 400, { error: `${key} must be a non-negative integer` }); return
               }
               patch[key] = value
+            }
+            if (input['summaryMode'] !== undefined) {
+              const value = input['summaryMode']
+              if (value !== 'auto' && value !== 'always' && value !== 'never') {
+                sendJson(res, 400, { error: 'summaryMode must be "auto", "always" or "never"' }); return
+              }
+              patch.summaryMode = value
             }
             sendJson(res, 200, await service.saveSettings(patch)); return
           }

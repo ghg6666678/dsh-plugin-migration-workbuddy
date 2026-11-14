@@ -1,4 +1,4 @@
-﻿import type { AutomationDraft } from './automation.js'
+import type { AutomationDraft } from './automation.js'
 
 export const PROBE_FORMAT_VERSION = 1
 export const MIGRATION_FORMAT_VERSION = 2
@@ -97,6 +97,8 @@ export interface ConvertedSession {
   title?: string
   events: unknown[]
   loss: LossRecord[]
+  /** Present when a WorkBuddy summary was folded into a checkpoint. */
+  summaryFold?: { shadowedEvents: number; shadowedTokens: number; keptTailEvents: number }
 }
 
 export interface MemoryRecord {

@@ -31,7 +31,8 @@ export function ImportPanel({ t, api, refreshSessions }: ImportPanelProps): Reac
   const [manifestLoading, setManifestLoading] = useState(false)
   const [manifestError, setManifestError] = useState<string>()
   const [limitMib, setLimitMib] = useState('0')
-  const [limitTokens, setLimitTokens] = useState('500')
+  const [limitTokens, setLimitTokens] = useState('0')
+  const [summaryMode, setSummaryMode] = useState<'auto' | 'always' | 'never'>('auto')
   const [savingLimit, setSavingLimit] = useState(false)
 
   const eligibleItems = (value: MigrationPreview | undefined): MigrationPreview['sessions'] => value?.sessions.filter(item => item.status === 'new' || item.status === 'changed' || item.status === 'repair') ?? []
@@ -46,6 +47,7 @@ export function ImportPanel({ t, api, refreshSessions }: ImportPanelProps): Reac
       .then(value => {
         setLimitMib(String(Math.max(0, Math.round((value.maxFileBytes ?? 0) / (1024 * 1024)))))
         setLimitTokens(String(Math.max(0, Math.round((value.maxContextTokens ?? 0) / 1000))))
+        setSummaryMode(value.summaryMode ?? 'auto')
       })
       .catch(() => undefined)
   }, [])
@@ -56,9 +58,10 @@ export function ImportPanel({ t, api, refreshSessions }: ImportPanelProps): Reac
       const mib = Math.max(0, Math.floor(Number(limitMib)))
       const tokens = Math.max(0, Math.floor(Number(limitTokens)))
       if (!Number.isFinite(mib) || !Number.isFinite(tokens)) throw new Error(t('settingsTitle'))
-      const saved = await api.saveSettings({ maxFileBytes: mib * 1024 * 1024, maxContextTokens: tokens * 1000 })
+      const saved = await api.saveSettings({ maxFileBytes: mib * 1024 * 1024, maxContextTokens: tokens * 1000, summaryMode })
       setLimitMib(String(Math.round((saved.maxFileBytes ?? 0) / (1024 * 1024))))
       setLimitTokens(String(Math.round((saved.maxContextTokens ?? 0) / 1000)))
+      setSummaryMode(saved.summaryMode ?? 'auto')
       refresh()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -153,7 +156,7 @@ export function ImportPanel({ t, api, refreshSessions }: ImportPanelProps): Reac
       <span>{t('importIntro')}</span>
     </div>
     <div className="mwb-migration-toolbar"><span className="mwb-migration-source">{loading ? t('preview') : total > 0 ? `✓ ${t('sourceFound')}` : t('sourceMissing')}</span><button className="mwb-migration-refresh" type="button" onClick={refresh} disabled={loading}>{t('refresh')}</button></div>
-    <div className="mwb-migration-settings"><strong>{t('settingsTitle')}</strong><label>{t('settingsLimit')} <input type="number" min={0} step={1} value={limitMib} onChange={event => setLimitMib(event.target.value)} /> {t('settingsUnlimited')}</label><label>{t('settingsContext')} <input type="number" min={0} step={1} value={limitTokens} onChange={event => setLimitTokens(event.target.value)} /></label><button className="mwb-migration-secondary" type="button" disabled={savingLimit} onClick={() => { void saveLimit() }}>{savingLimit ? t('working') : t('settingsSave')}</button></div>
+    <div className="mwb-migration-settings"><strong>{t('settingsTitle')}</strong><label>{t('settingsLimit')} <input type="number" min={0} step={1} value={limitMib} onChange={event => setLimitMib(event.target.value)} /> {t('settingsUnlimited')}</label><label>{t('settingsContext')} <input type="number" min={0} step={1} value={limitTokens} onChange={event => setLimitTokens(event.target.value)} /></label><label>{t('settingsSummary')} <select value={summaryMode} onChange={event => setSummaryMode(event.target.value as 'auto' | 'always' | 'never')}><option value="auto">{t('settingsSummaryAuto')}</option><option value="always">{t('settingsSummaryAlways')}</option><option value="never">{t('settingsSummaryNever')}</option></select></label><span className="mwb-migration-hint">{t('settingsSummaryHint')}</span><button className="mwb-migration-secondary" type="button" disabled={savingLimit} onClick={() => { void saveLimit() }}>{savingLimit ? t('working') : t('settingsSave')}</button></div>
     {error ? <div className="mwb-migration-error">{error}</div> : null}
     {loading ? null : preview && total > 0 ? <>
       <div className="mwb-migration-status">{canRun ? `${t('newItems')} ${Math.max(0, sessionEligible - counts.changed - counts.repair)} · ${t('changedItems')} ${counts.changed} · ${t('repairItems')} ${counts.repair} · ${t('memories')} ${counts.memoryEligible} · ${t('mcp')} ${counts.mcpEligible}` : t('upToDate')}{counts.lastImportedAt ? ` · ${t('lastImported')}: ${new Date(counts.lastImportedAt).toLocaleString()}` : ''}{counts.excludedDeletedSessions > 0 || counts.excludedMissingWorkspaces > 0 ? ` · ${t('excluded').replace('{deleted}', String(counts.excludedDeletedSessions)).replace('{missing}', counts.excludedMissingWorkspaces > 0 ? ` + ${String(counts.excludedMissingWorkspaces)} ${t('workspaceMode')}` : '')}` : ''}</div>

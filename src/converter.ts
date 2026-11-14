@@ -19,8 +19,11 @@ import { parseWorkBuddyInput } from './input-envelope.js'
  * v9: group rows into real turns and steps — one user request is one turn and
  * every assistant round is one step carrying its tool calls and results —
  * instead of emitting one turn per WorkBuddy row.
+ * v10: keep the memory summary as an ordinary message (View = full history).
+ * v11: `summaryMode: 'checkpoint'` folds WorkBuddy's own summaries into a real
+ * DSH compaction checkpoint so a huge project is continuable at import time.
  */
-export const MIGRATION_CONVERTER_VERSION = 10
+export const MIGRATION_CONVERTER_VERSION = 11
 
 export type ToolMode = 'transcript' | 'narrative'
 
@@ -156,6 +159,200 @@ export function trimEventsToBudget(events: SessionEvent[], budgetChars: number):
 
 export interface ConvertOptions {
   toolMode?: ToolMode
+  /**
+   * Fold a WorkBuddy long-term summary into a DSH compaction checkpoint so the
+   * imported project can be continued instead of merely read.
+   *
+   * `'none'` (default) imports the transcript verbatim. `'checkpoint'` keeps
+   * every appended event for the human transcript but lands a
+   * `compact-checkpoint` replacement over the summarized prefix, so the model
+   * receives the summary plus the recent tail instead of millions of tokens.
+   */
+  summaryMode?: SummaryMode
+  /**
+   * Token size of the recent tail kept outside the checkpoint in
+   * `summaryMode: 'checkpoint'`. The tail is what lets the model resume detailed
+   * work; everything older is represented by the summary. Defaults to
+   * `DEFAULT_SUMMARY_TAIL_TOKENS`.
+   */
+  summaryTailTokens?: number
+}
+
+/** Recent tail kept verbatim when folding a summary into a checkpoint. */
+export const DEFAULT_SUMMARY_TAIL_TOKENS = 40_000
+
+/**
+ * How an imported WorkBuddy summary is exposed to the model.
+ *
+ * - `auto` (default): fold only when the transcript is too large to continue
+ *   as-is. Small projects import verbatim; a multi-million-token project would
+ *   otherwise be unable to compact at all (the model never receives it).
+ * - `always`: fold whenever WorkBuddy wrote a summary.
+ * - `never`: import only; the summary stays ordinary history.
+ */
+export type SummaryMode = 'auto' | 'always' | 'never'
+
+/**
+ * Estimated log size above which a session cannot continue without a fold.
+ *
+ * DSH compacts at 80% of the model window and the default window is 300k
+ * tokens, so anything past ~240k is guaranteed to hit compaction on the very
+ * first message — and compaction cannot summarize a prompt the model itself
+ * cannot receive. Folding at import time is what makes those projects work.
+ */
+export const AUTO_SUMMARY_TOKENS = 200_000
+
+/** Chars per token for the rough budget DSH itself uses when trimming. */
+const CHARS_PER_TOKEN = 3
+
+/** Structured WorkBuddy long-term summary extracted from one transcript row. */
+interface WorkBuddySummary {
+  /** Text of the `<summary>` block — the part that actually carries state. */
+  text: string
+  /** Line number the block was found on, for loss reporting. */
+  line: number
+  /** Whether the row also re-embedded tool calls (the bulky, redundant form). */
+  embeddedHistory: boolean
+}
+
+/**
+ * Detect a WorkBuddy long-term memory row and pull out its `<summary>` block.
+ *
+ * WorkBuddy writes two shapes of the same summary: a compact one holding only
+ * `<conversation_history_summary>` (a few KB), and a much larger one that
+ * re-embeds hundreds of `<previous_tool_call>` records. Both carry the curated
+ * `<summary>` text; the re-embedded history is already covered by it, so only
+ * the summary is retained — that drops a 528 KB row to ~5 KB.
+ */
+function extractWorkBuddySummary(text: string, line: number): WorkBuddySummary | undefined {
+  if (text.length === 0) return undefined
+  const head = text.slice(0, 512)
+  const isMemory = /<cb_summary>|<conversation_history_summary>/i.test(head) || /历史压缩摘要/.test(head)
+  if (!isMemory) return undefined
+  const match = /<summary>([\s\S]*?)<\/summary>/i.exec(text)
+  // A memory row without a <summary> tag still ends up summarized state; keep
+  // the leading prose but never the re-embedded tool history.
+  const body = (match?.[1] ?? (match === null ? text.replace(/<previous_[a-z_]+>[\s\S]*?<\/previous_[a-z_]+>/gi, '') : '')).trim()
+  if (body.length < 80) return undefined
+  return { text: body, line, embeddedHistory: /<previous_tool_call>|<previous_user_message>/i.test(text) }
+}
+
+/** Collapse repeated re-embeddings of the same summary into one timeline. */
+function dedupeSummaries(summaries: WorkBuddySummary[]): WorkBuddySummary[] {
+  const seen = new Set<string>()
+  const kept: WorkBuddySummary[] = []
+  for (const summary of summaries) {
+    const key = createHash('sha256').update(summary.text).digest('hex')
+    if (seen.has(key)) continue
+    seen.add(key)
+    kept.push(summary)
+  }
+  return kept
+}
+
+/**
+ * Render the consolidated summary body for a DSH checkpoint.
+ *
+ * DSH's own summarizer prompt asks the model to *merge* a prior checkpoint
+ * instead of copying it forward; WorkBuddy never did, which is why one
+ * transcript accumulates a summary per compaction. Importing the distinct
+ * versions in order reproduces that consolidation without another model call.
+ */
+function renderSummaryBody(summaries: WorkBuddySummary[]): string {
+  if (summaries.length === 1) return summaries[0]!.text
+  const stages = summaries.map((summary, index) => `## 阶段 ${String(index + 1)}\n${summary.text}`).join('\n\n---\n\n')
+  return `（本摘要按时间顺序合并了 WorkBuddy 在各阶段生成的 ${String(summaries.length)} 份压缩摘要。）\n\n${stages}`
+}
+
+/**
+ * Build the DSH checkpoint replacement message.
+ *
+ * Mirrors `frameSummary` from `dsh-compaction-basic` — preamble plus
+ * `<compacted-summary>` open tag, the summary body, then the close tag — because
+ * every consumer recognizes a checkpoint by `data.source.kind ===
+ * 'compact-checkpoint'` together with a non-append `surfaceOp`, not by the text.
+ */
+function checkpointData(body: string, compactionId: string, shadowedTokens: number): Record<string, unknown> {
+  const preamble = 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. '
+    + 'Treat the captured context as established background and build on it without restating it. '
+    + 'Continue the task directly from the messages that follow, without acknowledging this checkpoint.'
+  return {
+    role: 'user',
+    id: randomUUID(),
+    content: [
+      { type: 'text', text: `${preamble}\n\n<compacted-summary>` },
+      { type: 'text', text: `<compacted-summary>\n\n${body}` },
+      { type: 'text', text: '</compacted-summary>' },
+    ],
+    source: { kind: 'compact-checkpoint', compactionId, shadowedTokenCount: shadowedTokens },
+  }
+}
+
+/** Assistant tool calls add to the pairing balance; each result closes one. */
+function pairingDelta(event: SessionEvent): number {
+  if (event.type === 'assistant/message') {
+    const message = (event.data as { message?: { content?: Array<{ type?: string }> } }).message
+    return (message?.content ?? []).filter(block => block.type === 'tool-call').length
+  }
+  if (event.type === 'tool/result') return -1
+  return 0
+}
+
+/**
+ * Fold the summarized prefix of an imported transcript into one checkpoint.
+ *
+ * The appended events stay in the log, so the human transcript keeps every
+ * message; the replacement only removes that prefix from the model-visible
+ * surface. This is the transition `dsh-compaction-basic` commits, performed at
+ * import time so a multi-million-token project is continuable immediately.
+ *
+ * @returns the extended event list plus fold statistics, or `undefined` when no
+ * balanced boundary exists within the tail budget.
+ */
+function foldSummaryIntoCheckpoint(
+  events: SessionEvent[],
+  summaries: WorkBuddySummary[],
+  tailTokens: number,
+): { events: SessionEvent[]; shadowedEvents: number; shadowedTokens: number; keptTailEvents: number } | undefined {
+  const nodes = events.filter(event => SURFACE_EVENT_TYPES.has(event.type) && (event as { surfaceOp?: unknown }).surfaceOp === 'append')
+  if (nodes.length < 3) return undefined
+  // Node 0 is the protected system head: a replace covering it must itself be a
+  // system/message, so the fold always starts at node 1.
+  const sizes = nodes.map(node => Math.round(JSON.stringify(node).length / CHARS_PER_TOKEN))
+  let keepFrom = nodes.length
+  let tail = 0
+  while (keepFrom > 2 && tail + sizes[keepFrom - 1]! <= tailTokens) {
+    tail += sizes[keepFrom - 1]!
+    keepFrom -= 1
+  }
+  if (keepFrom < 2) keepFrom = 2
+  // Never split a tool call from its result: walk the boundary back until the
+  // shadowed prefix is pair-balanced, exactly as the compaction engine does.
+  const balances: number[] = []
+  let balance = 0
+  for (const node of nodes) {
+    balance += pairingDelta(node)
+    if (balance < 0) return undefined
+    balances.push(balance)
+  }
+  let endIndex = keepFrom - 1
+  while (endIndex >= 1 && balances[endIndex] !== 0) endIndex -= 1
+  if (endIndex < 1) return undefined
+  const shadowed = nodes.slice(1, endIndex + 1)
+  if (shadowed.length === 0) return undefined
+  const shadowedTokens = shadowed.reduce((sum, _node, index) => sum + sizes[index + 1]!, 0)
+  const compactionId = randomUUID()
+  const seq = events.reduce((max, event) => Math.max(max, Number(event.seq)), 0) + 1
+  const checkpoint = {
+    type: 'user/message',
+    seq: SessionSeq(seq),
+    time: Number(events[events.length - 1]!.time) + 1,
+    surfaceOp: { op: 'replace', startSeq: SessionSeq(Number(nodes[1]!.seq)), endSeq: SessionSeq(Number(nodes[endIndex]!.seq)) },
+    // Every shadowed surface node must be cited or the fold rejects the replace.
+    sourceEventSeqs: shadowed.map(node => Number(node.seq)),
+    data: checkpointData(renderSummaryBody(summaries), compactionId, shadowedTokens),
+  } as unknown as SessionEvent
+  return { events: [...events, checkpoint], shadowedEvents: shadowed.length, shadowedTokens, keptTailEvents: nodes.length - endIndex - 1 }
 }
 
 type WorkBuddyRecord = Record<string, unknown>
@@ -523,6 +720,10 @@ export async function convertWorkBuddySession(path: string, root: string, metada
   // so each callId emits at most one assistant tool-call block and one result.
   const emittedCallIds = new Set<string>()
   const resultedCallIds = new Set<string>()
+  // WorkBuddy periodically folds its own history into a `<cb_summary>` memory
+  // row. Collect the distinct ones so `summaryMode: 'checkpoint'` can reuse that
+  // curation as a DSH checkpoint instead of paying for another summarization.
+  const summaries: WorkBuddySummary[] = []
   let title: string | undefined = metadata?.title
   let firstUserTitle: string | undefined
   let createdAt = Number.POSITIVE_INFINITY
@@ -551,7 +752,12 @@ export async function convertWorkBuddySession(path: string, root: string, metada
     else if (kind === 'summary') loss.push({ code: 'summary-metadata', detail: 'summary retained in import manifest' })
     else if (kind === 'message') {
       const role = row.role === 'assistant' ? 'assistant' : 'user'
-      const parsedInput = role === 'user' ? parseWorkBuddyInput(textOf(row.content)) : undefined
+      const rawText = textOf(row.content)
+      if (role === 'user') {
+        const memory = extractWorkBuddySummary(rawText, lineNumber)
+        if (memory !== undefined) summaries.push(memory)
+      }
+      const parsedInput = role === 'user' ? parseWorkBuddyInput(rawText) : undefined
       if (role === 'user' && firstUserTitle === undefined) {
         const candidate = (parsedInput?.text ?? textOf(row.content)).trim()
         if (candidate) firstUserTitle = candidate.slice(0, 80)
@@ -637,6 +843,45 @@ export async function convertWorkBuddySession(path: string, root: string, metada
   }
   normalizeMessageSources(events)
   normalizeAssistantSettlements(events)
+  // Fold AFTER every structural change above. `foldSurface` replays the log with
+  // the array index as the event sequence, so `surfaceOp` and `sourceEventSeqs`
+  // must cite final positions — folding earlier would cite pre-title indices and
+  // desynchronize every reference by one.
+  let fold: { shadowedEvents: number; shadowedTokens: number; keptTailEvents: number } | undefined
+  const summaryMode = options.summaryMode ?? 'auto'
+  if (summaryMode !== 'never') {
+    const distinct = dedupeSummaries(summaries)
+    // `auto` only intervenes when leaving the log intact would make the import
+    // unusable (see AUTO_SUMMARY_TOKENS). A small project keeps its real
+    // transcript so the model sees exactly what the user saw.
+    const logTokens = summaryMode === 'auto'
+      ? Math.round(events.reduce((sum, event) => sum + JSON.stringify(event).length, 0) / CHARS_PER_TOKEN)
+      : 0
+    if (summaryMode === 'auto' && logTokens <= AUTO_SUMMARY_TOKENS) {
+      // Nothing to do: the whole project already fits a normal turn.
+    } else if (distinct.length === 0) {
+      loss.push({
+        code: 'summary-missing',
+        detail: logTokens > 0
+          ? `这个会话约 ${String(logTokens)} token，超出可直接继续的范围，但 WorkBuddy 没有为它生成压缩摘要，因此只能按完整记录导入；发消息时 DSH 会尝试实时压缩`
+          : 'WorkBuddy 没有为这个会话生成压缩摘要，因此无法折叠成 checkpoint；已按完整记录导入',
+      })
+    } else {
+      // The part the summary does not already cover is the recent tail, so it
+      // survives the fold: it is what lets the model resume detailed work.
+      const folded = foldSummaryIntoCheckpoint(events, distinct, options.summaryTailTokens ?? DEFAULT_SUMMARY_TAIL_TOKENS)
+      if (folded === undefined) {
+        loss.push({ code: 'summary-unfoldable', detail: '摘要无法与导入事件安全对齐（工具调用与结果必须成对折叠）；已按完整记录导入' })
+      } else {
+        events.splice(0, events.length, ...folded.events)
+        fold = { shadowedEvents: folded.shadowedEvents, shadowedTokens: folded.shadowedTokens, keptTailEvents: folded.keptTailEvents }
+        loss.push({
+          code: 'summary-checkpoint',
+          detail: `已把 ${String(distinct.length)} 份 WorkBuddy 摘要合并为 DSH checkpoint：折叠 ${String(folded.shadowedEvents)} 条历史（约 ${String(folded.shadowedTokens)} token），保留最近 ${String(folded.keptTailEvents)} 条；对话记录本身完整保留，可随时查看`,
+        })
+      }
+    }
+  }
   const id = `workbuddy-${sourceHash.slice(0, 24)}`
   return {
     sourcePath: path,
@@ -650,5 +895,6 @@ export async function convertWorkBuddySession(path: string, root: string, metada
     ...(title ? { title } : {}),
     events,
     loss,
+    ...(fold === undefined ? {} : { summaryFold: fold }),
   }
 }

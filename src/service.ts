@@ -94,7 +94,7 @@ export async function writeSeededSession(
 interface Manifest {
   version: number
   updatedAt: string
-  sessions: Array<{ sourceHash: string; sourcePath: string; sourceSessionId?: string; sourceKey?: string; metadataHash?: string; targetSessionId: string; importId?: string; title?: string; mode?: WorkBuddyMode; workspacePath?: string; lastImportedAt?: string; status?: 'imported' | 'changed' | 'archived' | 'failed' | 'missing'; supersededBy?: string; archived?: boolean; converterVersion?: number; toolMode?: 'transcript' | 'narrative' }>
+  sessions: Array<{ sourceHash: string; sourcePath: string; sourceSessionId?: string; sourceKey?: string; metadataHash?: string; targetSessionId: string; importId?: string; title?: string; mode?: WorkBuddyMode; workspacePath?: string; lastImportedAt?: string; status?: 'imported' | 'changed' | 'archived' | 'failed' | 'missing'; supersededBy?: string; archived?: boolean; converterVersion?: number; toolMode?: 'transcript' | 'narrative'; summaryMode?: 'auto' | 'always' | 'never' }>
   memories: MemoryRecord[]
   mcp: McpDraft[]
   automations: Array<{ sourceId: string; fingerprint: string; targetRuleId: string; importedAt: string; status?: string }>
@@ -280,6 +280,11 @@ export interface MigrationSettings {
   maxFileBytes?: number
   /** Estimated context-token budget for one seed; 0 = keep everything. */
   maxContextTokens?: number
+  /**
+   * Whether to fold WorkBuddy's own compaction summary into a DSH checkpoint so
+   * a huge project is continuable right after import.
+   */
+  summaryMode?: 'auto' | 'always' | 'never'
 }
 
 function sanitizeSettings(value: unknown): MigrationSettings {
@@ -291,6 +296,11 @@ function sanitizeSettings(value: unknown): MigrationSettings {
     const raw = record[key]
     if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) throw new Error(`${key} must be a non-negative integer`)
     result[key] = raw
+  }
+  if (record['summaryMode'] !== undefined) {
+    const raw = record['summaryMode']
+    if (raw !== 'auto' && raw !== 'always' && raw !== 'never') throw new Error('summaryMode must be "auto", "always" or "never"')
+    result.summaryMode = raw
   }
   return result
 }
@@ -305,7 +315,7 @@ export class MigrationService {
   constructor(
     private readonly persistence: SessionPersistence,
     private readonly workspaceRegistry?: WorkspaceLike,
-    private readonly options: { sourceRoot?: string; maxFileBytes?: number; maxContextTokens?: number; maxFiles?: number; toolMode?: 'transcript' | 'narrative'; automationModelId?: string; automationModelAllowlist?: string[]; saveAutomationRule?: (rule: unknown) => Promise<void> } = {},
+    private readonly options: { sourceRoot?: string; maxFileBytes?: number; maxContextTokens?: number; summaryMode?: 'auto' | 'always' | 'never'; maxFiles?: number; toolMode?: 'transcript' | 'narrative'; automationModelId?: string; automationModelAllowlist?: string[]; saveAutomationRule?: (rule: unknown) => Promise<void> } = {},
   ) {
     const root = targetRoot()
     this.manifestPath = join(root, 'migration', 'manifest.json')
@@ -345,6 +355,19 @@ export class MigrationService {
     // conversation. A non-zero budget is an explicit opt-in that keeps only the
     // newest turns, so it must never be applied by default.
     return settings.maxContextTokens ?? this.options.maxContextTokens ?? 0
+  }
+
+  /**
+   * Fold policy for the WorkBuddy summary.
+   *
+   * `auto` is the default because a huge project cannot be continued otherwise:
+   * DSH compacts at 80% of the window, and compaction needs the model to receive
+   * the history it is asked to summarize. Folding at import reuses the summary
+   * WorkBuddy already paid for instead of re-summarizing 10M tokens.
+   */
+  private async summaryMode(): Promise<'auto' | 'always' | 'never'> {
+    const settings = await this.settings()
+    return settings.summaryMode ?? this.options.summaryMode ?? 'auto'
   }
 
   /** Migrated automations must not carry WorkBuddy model ids (unknown on the gateway). */
@@ -390,7 +413,8 @@ export class MigrationService {
           continue
         }
         const metadata = effectiveMetadata(item.path, source.sourceRoot, catalog)
-        const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode() })
+        const foldMode = await this.summaryMode()
+        const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode(), summaryMode: foldMode })
         const workspacePath = metadata?.mode === 'session' ? sessionModeWorkspacePath() : (converted.cwd ?? projectWorkspacePath(converted.projectHash))
         // A workspace whose directory is gone was deleted in WorkBuddy (or on
         // disk); importing its sessions would recreate a dead workspace.
@@ -403,7 +427,9 @@ export class MigrationService {
         const repair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
         // Metadata drift (title/cwd) must not force a re-import: that writes a
         // second copy of the same conversation for no content change.
-        const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
+        // Changing the fold policy must rebuild the seed, otherwise switching
+        // from 'never' to 'auto' would leave the huge session unusable.
+        const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode() || (known.summaryMode ?? 'auto') !== foldMode)
         const status: MigrationPreview['sessions'][number]['status'] = known === undefined ? 'new' : repair ? 'repair' : changed ? 'changed' : 'unchanged'
         const workspaceId = workspaceIdOf(workspacePath)
         sessions.push({ path: item.path, sourceSessionId: item.sessionId, projectHash: item.projectHash, bytes: item.bytes, key, ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}), ...(workspaceId ? { workspaceId } : {}), status, eligible: status !== 'unchanged', eventCount: converted.events.length, loss: converted.loss, sourceHash: converted.sourceHash })
@@ -534,6 +560,7 @@ export class MigrationService {
       const wsFilter = new Set(workspaceIds)
       const hasFilter = keyFilter.size > 0 || wsFilter.size > 0
       const contextBudget = await this.effectiveMaxContextTokens()
+      const summaryMode = await this.summaryMode()
       const allSourceKeys = new Set<string>()
       const allSourceWids = new Set<string>()
       for (const item of source.sessions) {
@@ -563,13 +590,17 @@ export class MigrationService {
               result.skippedSessions += 1; batch.skippedSessions += 1; continue
             }
           }
-          const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode() })
-          if (contextBudget > 0) {
+          const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode(), summaryMode })
+          if (converted.summaryFold === undefined && contextBudget > 0) {
             // `* 3` converts the token budget to a rough character budget
             // (≈3 chars/token). Trimming is strictly opt-in: the default budget is
             // 0, because dropping old turns here silently rewrote 77 MB
             // transcripts down to a handful of turns and the user lost history
             // they had already been reading in WorkBuddy.
+            //
+            // A folded session is skipped: the checkpoint already reduced the
+            // model-visible history to the summary plus a recent tail, and
+            // dropping turns would delete events the checkpoint cites.
             const trimmed = trimEventsToBudget(converted.events as SessionEvent[], contextBudget * 3)
             if (trimmed.droppedTurns > 0) {
               converted.events = trimmed.events
@@ -585,7 +616,7 @@ export class MigrationService {
           }
           const known = [...manifest.sessions].reverse().find(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path || entry.sourceHash === converted.sourceHash))
           const needsRepair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
-          const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
+          const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode() || (known.summaryMode ?? 'auto') !== summaryMode)
           if (known && selection.force !== true && !needsRepair && !changed) { result.skippedSessions += 1; batch.skippedSessions += 1; continue }
           // Re-importing a changed session must never archive, hide, or delete the
           // copy already in DSH. Archiving it removed the user's existing
@@ -629,7 +660,7 @@ export class MigrationService {
           // archived: the `known` lookup below walks newest-first, so the entry
           // pushed here wins on the next preview/import, and leaving the older row
           // unarchived keeps the audit trail readable instead of rewriting it.
-          manifest.sessions.push({ toolMode: this.toolMode(), sourceHash: converted.sourceHash, sourcePath: converted.sourcePath, sourceSessionId: converted.sourceSessionId, sourceKey: key, metadataHash: metadataHash(metadata), targetSessionId: targetId, importId: result.manifestId, converterVersion: MIGRATION_CONVERTER_VERSION, lastImportedAt: new Date().toISOString(), status: 'imported', ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}) })
+          manifest.sessions.push({ toolMode: this.toolMode(), summaryMode, sourceHash: converted.sourceHash, sourcePath: converted.sourcePath, sourceSessionId: converted.sourceSessionId, sourceKey: key, metadataHash: metadataHash(metadata), targetSessionId: targetId, importId: result.manifestId, converterVersion: MIGRATION_CONVERTER_VERSION, lastImportedAt: new Date().toISOString(), status: 'imported', ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}) })
           result.importedSessions += 1; batch.importedSessions += 1; result.loss.push(...converted.loss)
           await atomicJson(this.manifestPath, manifest)
         } catch (cause) { result.errors.push({ sourcePath: item.path, message: cause instanceof Error ? cause.message : String(cause) }); batch.errors += 1 }

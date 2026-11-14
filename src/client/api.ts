@@ -3,6 +3,7 @@ import type { MigrationPreview, MigrationResult } from '../model.js'
 export interface MigrationSettings {
   maxFileBytes?: number
   maxContextTokens?: number
+  summaryMode?: 'auto' | 'always' | 'never'
 }
 
 export interface MigrationApi {

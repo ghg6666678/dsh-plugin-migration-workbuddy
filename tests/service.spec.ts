@@ -353,6 +353,67 @@ describe('MigrationService context budget', () => {
   })
 })
 
+describe('MigrationService summary fold', () => {
+  /** A transcript big enough that `auto` must fold, carrying one WB summary. */
+  async function writeFoldableSource(): Promise<string> {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-fold-source-'))
+    const project = join(sourceRoot, 'projects', 'p')
+    await mkdir(project, { recursive: true })
+    const summary = 'Established the parser, the CLI entry point and the catalog reader. '
+      + 'Remaining work: wire the fold into the service layer and verify it against '
+      + 'a real transcript before publishing.'
+    const lines = [
+      JSON.stringify({ type: 'message', role: 'user', content: 'start', cwd: sourceRoot, timestamp: 1000 }),
+      ...Array.from({ length: 40 }, (_, index) => JSON.stringify({ type: 'message', role: 'assistant', content: `step ${String(index)} ${'x'.repeat(20_000)}`, timestamp: 2000 + index })),
+      JSON.stringify({ type: 'message', role: 'user', timestamp: 9000, content: `<conversation_history_summary>\n<summary>${summary}</summary>\n</conversation_history_summary>` }),
+      JSON.stringify({ type: 'message', role: 'user', content: 'later question', timestamp: 9500 }),
+    ]
+    await writeFile(join(project, 'big.jsonl'), `${lines.join('\n')}\n`)
+    return sourceRoot
+  }
+
+  it('folds by default and records why, so a huge project stays continuable', async () => {
+    const sourceRoot = await writeFoldableSource()
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-fold-target-'))
+    const written: Array<{ events: Array<{ data?: { source?: { kind?: string } } }> }> = []
+    const persistence = {
+      create: async () => ({ append: async (body: { events: never[] }) => { written.push(body as never) }, flush: async () => undefined, close: async () => undefined }),
+      append: async () => undefined,
+    }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      // `auto` is the default: no setting is required for the large case.
+      expect((await service.settings()).summaryMode).toBeUndefined()
+      const result = await service.migrate({ sessions: true, memories: false, mcp: false })
+      expect(result.importedSessions).toBe(1)
+      expect(result.loss.map(item => item.code)).toContain('summary-checkpoint')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+
+  it('honours summaryMode "never" and keeps the untouched transcript', async () => {
+    const sourceRoot = await writeFoldableSource()
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-fold-target-'))
+    const persistence = { create: async () => ({ append: async () => undefined, flush: async () => undefined, close: async () => undefined }), append: async () => undefined }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      await service.saveSettings({ summaryMode: 'never' })
+      const result = await service.migrate({ sessions: true, memories: false, mcp: false })
+      expect(result.importedSessions).toBe(1)
+      expect(result.loss.map(item => item.code)).not.toContain('summary-checkpoint')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+})
+
 describe('MigrationService archive bookkeeping', () => {
   /**
    * `archiveSession()` reports refusal in its result object and never throws, so

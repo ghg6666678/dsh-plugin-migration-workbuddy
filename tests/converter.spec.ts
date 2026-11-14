@@ -295,3 +295,138 @@ describe('WorkBuddy converter context budget', () => {
     expect([...resultIds.values()].every(count => count === 1)).toBe(true)
   })
 })
+
+describe('WorkBuddy summary checkpoint', () => {
+  /** Real WorkBuddy summaries run 4–7K chars; this mirrors that shape. */
+  const SUMMARY = 'Earlier work established the parser and the CLI entry point. '
+    + 'The parser accepts both the legacy and current envelope shapes, and the CLI '
+    + 'entry point validates the working directory before touching the catalog. '
+    + 'Remaining work: wire the fold into the import path and document it.'
+
+  /** One WorkBuddy memory row, in the compact shape it writes between compactions. */
+  function memoryRow(summary: string): string {
+    return JSON.stringify({
+      type: 'message',
+      role: 'user',
+      timestamp: 9000,
+      content: `<conversation_history_summary>\n<analysis>scratch</analysis>\n<summary>${summary}</summary>\n</conversation_history_summary>`,
+    })
+  }
+
+  /** Build a transcript whose size forces `auto` to fold. */
+  async function bigTranscript(): Promise<{ root: string; path: string }> {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-summary-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    const rows: string[] = []
+    rows.push(JSON.stringify({ type: 'message', role: 'user', content: 'start the project', timestamp: 1000 }))
+    // Padding is what pushes the log past AUTO_SUMMARY_TOKENS; the fold must
+    // then replace exactly the summarized prefix and keep the recent tail.
+    for (let index = 0; index < 40; index += 1) {
+      rows.push(JSON.stringify({ type: 'message', role: 'assistant', content: `step ${index} ${'x'.repeat(20_000)}`, timestamp: 2000 + index }))
+    }
+    rows.push(memoryRow(SUMMARY))
+    rows.push(JSON.stringify({ type: 'message', role: 'user', content: 'recent question', timestamp: 8000 }))
+    rows.push(JSON.stringify({ type: 'message', role: 'assistant', content: 'recent answer', timestamp: 8500 }))
+    await writeFile(path, rows.join('\n'))
+    return { root, path }
+  }
+
+  it('does not fold a small project, so the model sees the real transcript', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-small-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'hello', timestamp: 1000 }),
+      memoryRow('A tiny summary that is long enough to be recognized by the extractor, '
+        + 'which requires at least eighty characters of curated state before it treats '
+        + 'a row as a compaction summary rather than an ordinary message.'),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'hi', timestamp: 2000 }),
+    ].join('\n'))
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'auto' })
+    const checkpoints = (converted.events as Array<{ data?: { source?: { kind?: string } } }>)
+      .filter(event => event.data?.source?.kind === 'compact-checkpoint')
+    expect(checkpoints).toHaveLength(0)
+    expect(converted.summaryFold).toBeUndefined()
+  })
+
+  it('folds WorkBuddy summaries into one DSH checkpoint over the summarized prefix', async () => {
+    const { root, path } = await bigTranscript()
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'always' })
+    const events = converted.events as Array<{
+      type?: string
+      seq?: number
+      surfaceOp?: unknown
+      sourceEventSeqs?: number[]
+      data?: { content?: Array<{ type?: string; text?: string }>; source?: { kind?: string; compactionId?: string }; role?: string }
+    }>
+
+    const checkpoints = events.filter(event => event.data?.source?.kind === 'compact-checkpoint')
+    expect(checkpoints).toHaveLength(1)
+    const checkpoint = checkpoints[0]!
+    expect(checkpoint.type).toBe('user/message')
+    expect(checkpoint.data?.role).toBe('user')
+
+    // A checkpoint is recognized by a NON-append surface op; 'append' would make
+    // it ordinary history and leave the huge prefix in the model's context.
+    const op = checkpoint.surfaceOp as { op?: string; startSeq?: number; endSeq?: number }
+    expect(op.op).toBe('replace')
+    expect(op.startSeq).toBeGreaterThanOrEqual(1)
+    expect(op.endSeq).toBeGreaterThan(op.startSeq!)
+    expect(op.endSeq!).toBeLessThan(Number(checkpoint.seq))
+
+    // Every shadowed surface node must be cited or the surface fold rejects it.
+    const shadowed = events.filter(event => ['user/message', 'assistant/message', 'tool/result'].includes(event.type ?? '')
+      && (event as { surfaceOp?: unknown }).surfaceOp === 'append'
+      && Number(event.seq) >= op.startSeq! && Number(event.seq) <= op.endSeq!)
+    expect(checkpoint.sourceEventSeqs).toEqual(shadowed.map(event => Number(event.seq)))
+    expect(new Set(checkpoint.sourceEventSeqs).size).toBe(checkpoint.sourceEventSeqs!.length)
+
+    // Framing must match what `dsh-compaction-basic` writes.
+    const content = checkpoint.data?.content ?? []
+    expect(content).toHaveLength(3)
+    expect(content[0]!.text).toContain('<compacted-summary>')
+    expect(content[1]!.text).toContain('Earlier work established the parser')
+    expect(content[2]!.text).toBe('</compacted-summary>')
+    expect(converted.summaryFold?.shadowedEvents).toBe(shadowed.length)
+    expect(converted.loss.map(item => item.code)).toContain('summary-checkpoint')
+  })
+
+  it('merges every distinct summary version and drops repeats', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-merge-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    // The same summary written three times, then a newer distinct one: the fold
+    // must keep both versions once each, in order.
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'start', timestamp: 1000 }),
+      memoryRow(SUMMARY),
+      memoryRow(SUMMARY),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'progress', timestamp: 2000 }),
+      memoryRow('A later summary recording that the fold was wired through the service layer and verified against a real transcript.'),
+      memoryRow(SUMMARY),
+    ].join('\n'))
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'always' })
+    const checkpoint = (converted.events as Array<{ data?: { source?: { kind?: string }; content?: Array<{ text?: string }> } }>)
+      .find(event => event.data?.source?.kind === 'compact-checkpoint')
+    expect(checkpoint).toBeDefined()
+    const body = (checkpoint?.data?.content ?? []).map(block => block.text ?? '').join('')
+    expect(body.split('Earlier work established the parser').length - 1).toBe(1)
+    expect(body.split('A later summary recording').length - 1).toBe(1)
+    // Earlier stage must precede the later one.
+    expect(body.indexOf('Earlier work established')).toBeLessThan(body.indexOf('A later summary recording'))
+  })
+
+  it('reports why a huge transcript without any summary cannot be folded', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-nosum-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'start', timestamp: 1000 }),
+      ...Array.from({ length: 40 }, (_, index) => JSON.stringify({ type: 'message', role: 'assistant', content: `part ${String(index)} ${'y'.repeat(20_000)}`, timestamp: 2000 + index })),
+    ].join('\n'))
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'auto' })
+    expect(converted.summaryFold).toBeUndefined()
+    expect(converted.loss.map(item => item.code)).toContain('summary-missing')
+  })
+})

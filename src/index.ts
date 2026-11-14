@@ -35,6 +35,7 @@ export function apply(ctx: Context, rawConfig: Partial<ReturnType<typeof normali
   const service = new MigrationService(ctx.sessionPersistence, ctx.get('workspaceRegistry'), {
     maxFileBytes: config.maxFileBytes,
     maxContextTokens: config.maxContextTokens,
+    summaryMode: config.summaryMode,
     maxFiles: config.maxFiles,
     toolMode: config.toolMode,
     automationModelId: config.automationModelId,
