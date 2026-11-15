@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { SESSION_FORMAT_VERSION, SessionId, SessionLogOffset, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
@@ -94,7 +94,7 @@ export async function writeSeededSession(
 interface Manifest {
   version: number
   updatedAt: string
-  sessions: Array<{ sourceHash: string; sourcePath: string; sourceSessionId?: string; sourceKey?: string; metadataHash?: string; targetSessionId: string; importId?: string; title?: string; mode?: WorkBuddyMode; workspacePath?: string; lastImportedAt?: string; status?: 'imported' | 'changed' | 'archived' | 'failed' | 'missing'; supersededBy?: string; archived?: boolean; converterVersion?: number; toolMode?: 'transcript' | 'narrative' }>
+  sessions: Array<{ sourceHash: string; sourcePath: string; sourceSessionId?: string; sourceKey?: string; metadataHash?: string; targetSessionId: string; importId?: string; title?: string; mode?: WorkBuddyMode; workspacePath?: string; lastImportedAt?: string; status?: 'imported' | 'changed' | 'archived' | 'failed' | 'missing'; supersededBy?: string; archived?: boolean; converterVersion?: number; toolMode?: 'transcript' | 'narrative'; summaryMode?: 'auto' | 'always' | 'never' }>
   memories: MemoryRecord[]
   mcp: McpDraft[]
   automations: Array<{ sourceId: string; fingerprint: string; targetRuleId: string; importedAt: string; status?: string }>
@@ -122,6 +122,65 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 }
 
 function targetRoot(): string { return process.env.DSH_HOME ?? join(homedir(), '.dsh') }
+
+/**
+ * Move a stored session directory out of the live tree before rewriting the
+ * same id.
+ *
+ * A published log is immutable — `sessionPersistence.create()` refuses an id
+ * that already exists — so repairing a session in place means removing the old
+ * copy first. The directory is moved (never deleted) under
+ * `$DSH_HOME/repair-backups`, so the previous conversation stays recoverable.
+ *
+ * @returns the backup path, or `undefined` when there was nothing to move.
+ */
+async function archiveStoredSession(root: string, sessionId: string): Promise<string | undefined> {
+  const sessionsRoot = join(root, 'sessions')
+  if (!existsSync(sessionsRoot)) return undefined
+  let groups: string[]
+  try {
+    groups = await readdir(sessionsRoot)
+  } catch {
+    return undefined
+  }
+  for (const group of groups) {
+    const source = join(sessionsRoot, group, sessionId)
+    if (!existsSync(source)) continue
+    const destination = join(root, 'repair-backups', `reimport-${new Date().toISOString().replace(/[:.]/g, '-')}`, group, sessionId)
+    await mkdir(join(destination, '..'), { recursive: true, mode: 0o700 })
+    try {
+      await rename(source, destination)
+    } catch {
+      // A cross-device or locked move must not abort the import.
+      return undefined
+    }
+    return destination
+  }
+  return undefined
+}
+
+/**
+ * Move every stored copy of one source's conversations out of the live tree.
+ *
+ * The target id is derived from the source hash, so a transcript that grew in
+ * WorkBuddy produces a NEW id and leaves the previous one behind. Older
+ * releases also minted a derived id (`<id>-<timestamp>`) on every repair,
+ * which split one chat into two in the sidebar. Both leftovers are copies of
+ * the same conversation, so they are archived together with the target: the
+ * user keeps exactly one conversation per WorkBuddy session, and nothing is
+ * deleted — every displaced copy stays recoverable under `repair-backups/`.
+ *
+ * @returns the backup paths, empty when there was nothing to move.
+ */
+async function archiveSourceCopies(root: string, sessionIds: readonly string[]): Promise<string[]> {
+  const moved: string[] = []
+  for (const id of new Set(sessionIds)) {
+    if (id === undefined) continue
+    const destination = await archiveStoredSession(root, id)
+    if (destination !== undefined) moved.push(destination)
+  }
+  return moved
+}
 
 /** Directory (under `$DSH_HOME/workspaces`) that owns imported conversations. */
 const WORKBUDDY_WORKSPACE_DIR = 'workbuddy-imported'
@@ -280,6 +339,11 @@ export interface MigrationSettings {
   maxFileBytes?: number
   /** Estimated context-token budget for one seed; 0 = keep everything. */
   maxContextTokens?: number
+  /**
+   * Whether to fold WorkBuddy's own compaction summary into a DSH checkpoint so
+   * a huge project is continuable right after import.
+   */
+  summaryMode?: 'auto' | 'always' | 'never'
 }
 
 function sanitizeSettings(value: unknown): MigrationSettings {
@@ -291,6 +355,11 @@ function sanitizeSettings(value: unknown): MigrationSettings {
     const raw = record[key]
     if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) throw new Error(`${key} must be a non-negative integer`)
     result[key] = raw
+  }
+  if (record['summaryMode'] !== undefined) {
+    const raw = record['summaryMode']
+    if (raw !== 'auto' && raw !== 'always' && raw !== 'never') throw new Error('summaryMode must be "auto", "always" or "never"')
+    result.summaryMode = raw
   }
   return result
 }
@@ -305,7 +374,7 @@ export class MigrationService {
   constructor(
     private readonly persistence: SessionPersistence,
     private readonly workspaceRegistry?: WorkspaceLike,
-    private readonly options: { sourceRoot?: string; maxFileBytes?: number; maxContextTokens?: number; maxFiles?: number; toolMode?: 'transcript' | 'narrative'; automationModelId?: string; automationModelAllowlist?: string[]; saveAutomationRule?: (rule: unknown) => Promise<void> } = {},
+    private readonly options: { sourceRoot?: string; maxFileBytes?: number; maxContextTokens?: number; summaryMode?: 'auto' | 'always' | 'never'; maxFiles?: number; toolMode?: 'transcript' | 'narrative'; automationModelId?: string; automationModelAllowlist?: string[]; saveAutomationRule?: (rule: unknown) => Promise<void> } = {},
   ) {
     const root = targetRoot()
     this.manifestPath = join(root, 'migration', 'manifest.json')
@@ -341,7 +410,23 @@ export class MigrationService {
 
   private async effectiveMaxContextTokens(): Promise<number> {
     const settings = await this.settings()
-    return settings.maxContextTokens ?? this.options.maxContextTokens ?? 500_000
+    // 0 (the default) disables trimming: an import must reproduce the whole
+    // conversation. A non-zero budget is an explicit opt-in that keeps only the
+    // newest turns, so it must never be applied by default.
+    return settings.maxContextTokens ?? this.options.maxContextTokens ?? 0
+  }
+
+  /**
+   * Fold policy for the WorkBuddy summary.
+   *
+   * `auto` is the default because a huge project cannot be continued otherwise:
+   * DSH compacts at 80% of the window, and compaction needs the model to receive
+   * the history it is asked to summarize. Folding at import reuses the summary
+   * WorkBuddy already paid for instead of re-summarizing 10M tokens.
+   */
+  private async summaryMode(): Promise<'auto' | 'always' | 'never'> {
+    const settings = await this.settings()
+    return settings.summaryMode ?? this.options.summaryMode ?? 'auto'
   }
 
   /** Migrated automations must not carry WorkBuddy model ids (unknown on the gateway). */
@@ -387,7 +472,8 @@ export class MigrationService {
           continue
         }
         const metadata = effectiveMetadata(item.path, source.sourceRoot, catalog)
-        const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode() })
+        const foldMode = await this.summaryMode()
+        const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode(), summaryMode: foldMode })
         const workspacePath = metadata?.mode === 'session' ? sessionModeWorkspacePath() : (converted.cwd ?? projectWorkspacePath(converted.projectHash))
         // A workspace whose directory is gone was deleted in WorkBuddy (or on
         // disk); importing its sessions would recreate a dead workspace.
@@ -398,9 +484,11 @@ export class MigrationService {
         const key = sourceKey(item, metadata, source.sourceRoot)
         const known = [...manifest.sessions].reverse().find(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path))
         const repair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
-        // Metadata drift (title/cwd) must not force a re-import: that replaces
-        // the session and archives the old copy for no content change.
-        const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
+        // Metadata drift (title/cwd) must not force a re-import: that writes a
+        // second copy of the same conversation for no content change.
+        // Changing the fold policy must rebuild the seed, otherwise switching
+        // from 'never' to 'auto' would leave the huge session unusable.
+        const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode() || (known.summaryMode ?? 'auto') !== foldMode)
         const status: MigrationPreview['sessions'][number]['status'] = known === undefined ? 'new' : repair ? 'repair' : changed ? 'changed' : 'unchanged'
         const workspaceId = workspaceIdOf(workspacePath)
         sessions.push({ path: item.path, sourceSessionId: item.sessionId, projectHash: item.projectHash, bytes: item.bytes, key, ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}), ...(workspaceId ? { workspaceId } : {}), status, eligible: status !== 'unchanged', eventCount: converted.events.length, loss: converted.loss, sourceHash: converted.sourceHash })
@@ -531,6 +619,7 @@ export class MigrationService {
       const wsFilter = new Set(workspaceIds)
       const hasFilter = keyFilter.size > 0 || wsFilter.size > 0
       const contextBudget = await this.effectiveMaxContextTokens()
+      const summaryMode = await this.summaryMode()
       const allSourceKeys = new Set<string>()
       const allSourceWids = new Set<string>()
       for (const item of source.sessions) {
@@ -560,12 +649,21 @@ export class MigrationService {
               result.skippedSessions += 1; batch.skippedSessions += 1; continue
             }
           }
-          const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode() })
-          if (contextBudget > 0) {
+          const converted = await convertWorkBuddySession(item.path, source.sourceRoot, metadata, { toolMode: this.toolMode(), summaryMode })
+          if (converted.summaryFold === undefined && contextBudget > 0) {
+            // `* 3` converts the token budget to a rough character budget
+            // (≈3 chars/token). Trimming is strictly opt-in: the default budget is
+            // 0, because dropping old turns here silently rewrote 77 MB
+            // transcripts down to a handful of turns and the user lost history
+            // they had already been reading in WorkBuddy.
+            //
+            // A folded session is skipped: the checkpoint already reduced the
+            // model-visible history to the summary plus a recent tail, and
+            // dropping turns would delete events the checkpoint cites.
             const trimmed = trimEventsToBudget(converted.events as SessionEvent[], contextBudget * 3)
             if (trimmed.droppedTurns > 0) {
               converted.events = trimmed.events
-              result.loss.push({ code: 'context-trimmed', detail: `${String(trimmed.droppedTurns)} earlier turn(s) omitted to fit the ${String(contextBudget)}-token context budget` })
+              result.loss.push({ code: 'context-trimmed', detail: `dropped the oldest ${String(trimmed.droppedTurns)} turn(s) to fit the ${String(contextBudget)}-token budget you configured; set the budget to 0 to import the whole conversation` })
             }
           }
           if (hasFilter) {
@@ -577,16 +675,32 @@ export class MigrationService {
           }
           const known = [...manifest.sessions].reverse().find(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path || entry.sourceHash === converted.sourceHash))
           const needsRepair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
-          const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode())
+          const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode() || (known.summaryMode ?? 'auto') !== summaryMode)
           if (known && selection.force !== true && !needsRepair && !changed) { result.skippedSessions += 1; batch.skippedSessions += 1; continue }
-          const targetId = known ? `${converted.targetSessionId}-${Date.now().toString(36)}` : converted.targetSessionId
-          if (known && this.workspaceRegistry) {
-            try {
-              await (this.workspaceRegistry as WorkspaceLike & { archiveSession?: (id: string) => Promise<void> }).archiveSession?.(known.targetSessionId)
-            } catch (cause) {
-              result.loss.push({ code: 'legacy-session-archive-failed', detail: cause instanceof Error ? cause.message : String(cause) })
-            }
-          }
+          // A repair or content change rewrites the SAME session id. Minting a
+          // derived id (the previous behaviour) left the old copy in place and
+          // produced a second, duplicate conversation in the sidebar — the user
+          // saw one chat split into two every time a repair ran. A stored log is
+          // immutable (persistence publishes with a no-overwrite publish), so the
+          // previous directory is moved to `repair-backups/` first: that keeps one
+          // conversation per source and still leaves the old bytes recoverable.
+          // The move is only a rename, so a failed re-import can be restored by
+          // moving the directory back.
+          //
+          // Every id this source ever used is archived, not just the current one:
+          // the id is derived from the source hash, so a transcript that grew in
+          // WorkBuddy yields a new id, and older releases minted yet another
+          // derived id on every repair. Archiving all of them is what guarantees
+          // one conversation per WorkBuddy session in the sidebar.
+          const targetId = known === undefined ? converted.targetSessionId : known.targetSessionId
+          const displaced = await archiveSourceCopies(targetRoot(), [
+            targetId,
+            converted.targetSessionId,
+            ...manifest.sessions
+              .filter(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path || entry.sourceHash === converted.sourceHash))
+              .map(entry => entry.targetSessionId),
+          ])
+          for (const destination of displaced) result.loss.push({ code: 'session-replaced', detail: `同一会话在原地重写；旧记录已备份到 ${displayPath(destination)}` })
           // Session-mode sessions always belong to the shared session-mode
           // workspace. The transcript may carry its own absolute `cwd` (newer
           // WorkBuddy builds stamp it on every row); using that here would
@@ -618,8 +732,11 @@ export class MigrationService {
               result.loss.push({ code: 'workspace-attach-failed', detail: cause instanceof Error ? cause.message : String(cause) })
             }
           }
-          if (known) { known.archived = true; known.status = 'archived'; known.supersededBy = targetId }
-          manifest.sessions.push({ toolMode: this.toolMode(), sourceHash: converted.sourceHash, sourcePath: converted.sourcePath, sourceSessionId: converted.sourceSessionId, sourceKey: key, metadataHash: metadataHash(metadata), targetSessionId: targetId, importId: result.manifestId, converterVersion: MIGRATION_CONVERTER_VERSION, lastImportedAt: new Date().toISOString(), status: 'imported', ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}) })
+          // The previous manifest entry stays as import history. It is NOT marked
+          // archived: the `known` lookup below walks newest-first, so the entry
+          // pushed here wins on the next preview/import, and leaving the older row
+          // unarchived keeps the audit trail readable instead of rewriting it.
+          manifest.sessions.push({ toolMode: this.toolMode(), summaryMode, sourceHash: converted.sourceHash, sourcePath: converted.sourcePath, sourceSessionId: converted.sourceSessionId, sourceKey: key, metadataHash: metadataHash(metadata), targetSessionId: targetId, importId: result.manifestId, converterVersion: MIGRATION_CONVERTER_VERSION, lastImportedAt: new Date().toISOString(), status: 'imported', ...(converted.title ? { title: converted.title } : {}), ...(metadata?.mode ? { mode: metadata.mode } : {}), ...(workspacePath ? { workspacePath } : {}) })
           result.importedSessions += 1; batch.importedSessions += 1; result.loss.push(...converted.loss)
           await atomicJson(this.manifestPath, manifest)
         } catch (cause) { result.errors.push({ sourcePath: item.path, message: cause instanceof Error ? cause.message : String(cause) }); batch.errors += 1 }
@@ -703,17 +820,29 @@ export class MigrationService {
     } finally { this.running = false }
   }
 
-  async archiveLastImport(manifestId?: string): Promise<{ archived: number }> {
+  async archiveLastImport(manifestId?: string): Promise<{ archived: number; failed: number }> {
     void manifestId
     const manifest = await this.state()
     let archived = 0
+    let failed = 0
     for (const entry of manifest.sessions) {
       if (entry.archived === true || (manifestId !== undefined && entry.importId !== manifestId)) continue
-      if (this.workspaceRegistry) { try { await (this.workspaceRegistry as WorkspaceLike & { archiveSession?: (id: string) => Promise<void> }).archiveSession?.(entry.targetSessionId) } catch { /* retain manifest audit even when archive is unavailable */ } }
+      // archiveSession() reports failure through its return value instead of
+      // throwing, so read the result: a silently refused archive must not be
+      // recorded as archived, or the manifest claims a state the sidebar does
+      // not show.
+      let ok = true
+      if (this.workspaceRegistry) {
+        try {
+          const result = await (this.workspaceRegistry as WorkspaceLike & { archiveSession?: (id: string) => Promise<unknown> }).archiveSession?.(entry.targetSessionId) as { ok?: boolean } | undefined
+          if (result !== undefined && result.ok === false) ok = false
+        } catch { ok = false }
+      }
+      if (!ok) { failed += 1; continue }
       entry.archived = true; archived += 1
     }
     await atomicJson(this.manifestPath, manifest)
-    return { archived }
+    return { archived, failed }
   }
 
   async setMemoryEnabled(id: string, enabled: boolean): Promise<MemoryRecord | undefined> {

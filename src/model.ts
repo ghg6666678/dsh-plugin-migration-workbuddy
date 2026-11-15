@@ -97,6 +97,12 @@ export interface ConvertedSession {
   title?: string
   events: unknown[]
   loss: LossRecord[]
+  /**
+   * Present when the import folded the summarized prefix into a DSH
+   * `compact-checkpoint`: how much history it shadowed, how large that range was
+   * (runtime heuristic tokens), and how many events stayed outside it.
+   */
+  summaryFold?: { shadowedEvents: number; shadowedTokens: number; keptTailEvents: number }
 }
 
 export interface MemoryRecord {
