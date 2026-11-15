@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { convertWorkBuddySession, trimEventsToBudget } from '../src/converter.js'
+import { estimateEventTokens } from '../src/tokens.js'
 
 /** The pinned test peer predates system/message; derive messages without it. */
 function derivable(events: readonly unknown[]): never[] {
@@ -366,7 +367,6 @@ describe('WorkBuddy summary checkpoint', () => {
     const checkpoint = checkpoints[0]!
     expect(checkpoint.type).toBe('user/message')
     expect(checkpoint.data?.role).toBe('user')
-
     // A checkpoint is recognized by a NON-append surface op; 'append' would make
     // it ordinary history and leave the huge prefix in the model's context.
     const op = checkpoint.surfaceOp as { op?: string; startSeq?: number; endSeq?: number }
@@ -375,12 +375,53 @@ describe('WorkBuddy summary checkpoint', () => {
     expect(op.endSeq).toBeGreaterThan(op.startSeq!)
     expect(op.endSeq!).toBeLessThan(Number(checkpoint.seq))
 
-    // Every shadowed surface node must be cited or the surface fold rejects it.
+    // Every shadowed surface node must be cited or the surface fold rejects it,
+    // and the two transaction frames are cited ahead of them.
     const shadowed = events.filter(event => ['user/message', 'assistant/message', 'tool/result'].includes(event.type ?? '')
       && (event as { surfaceOp?: unknown }).surfaceOp === 'append'
       && Number(event.seq) >= op.startSeq! && Number(event.seq) <= op.endSeq!)
-    expect(checkpoint.sourceEventSeqs).toEqual(shadowed.map(event => Number(event.seq)))
+    expect(checkpoint.sourceEventSeqs!.slice(2)).toEqual(shadowed.map(event => Number(event.seq)))
     expect(new Set(checkpoint.sourceEventSeqs).size).toBe(checkpoint.sourceEventSeqs!.length)
+
+    // The replacement is only legal inside an open compaction transaction: the
+    // reader rejects a bare checkpoint with "compaction checkpoint has no
+    // matching compaction/start". The import must reproduce the four frames
+    // `compactSurfaceRegion` commits, in that exact order.
+    const compactionId = checkpoint.data?.source?.compactionId
+    expect(compactionId).toBeDefined()
+    const lifecycle = events.filter(event => event.type?.startsWith('compaction/') === true)
+    expect(lifecycle.map(event => event.type)).toEqual([
+      'compaction/start',
+      'compaction/summary',
+      'compaction/end',
+    ])
+    for (const frame of lifecycle) {
+      expect((frame.data as { compactionId?: string }).compactionId).toBe(compactionId)
+    }
+    const [start, summary, end] = lifecycle
+    for (const frame of [start!, end!]) {
+      // `turn: null` is the out-of-turn (manual) form, the only one valid in a
+      // seeded log whose last turn is already closed. `compaction/summary`
+      // carries no `turn`, so only the two lifecycle frames are checked.
+      expect((frame.data as { turn?: unknown }).turn).toBeNull()
+    }
+    expect(Number(start!.seq)).toBeLessThan(Number(checkpoint.seq))
+    expect(Number(summary!.seq)).toBe(Number(start!.seq) + 1)
+    expect(Number(end!.seq)).toBeGreaterThan(Number(checkpoint.seq))
+    // The transaction precedes the inherited seed marker, which clears the open
+    // compaction; appending it after would leave the transaction unclosed.
+    const seedIndex = events.findIndex(event => event.type === 'session/end-seed')
+    expect(seedIndex).toBe(-1)
+    expect(Number(end!.seq)).toBe(events.reduce((max, event) => Math.max(max, Number(event.seq)), Number.NEGATIVE_INFINITY))
+    // `compaction/summary` cites the same span the replacement shadows, and its
+    // endpoints must match `shadowedSeqs` exactly.
+    const summaryData = summary!.data as { shadowedRange?: { start?: number; end?: number }; shadowedSeqs?: number[]; summary?: Array<{ type?: string; text?: string }> }
+    expect(summaryData.shadowedRange).toEqual({ start: op.startSeq, end: op.endSeq })
+    expect(summaryData.shadowedSeqs).toEqual(shadowed.map(event => Number(event.seq)))
+    expect(summaryData.summary?.[0]?.text).toContain('Earlier work established the parser')
+    // The cited frames must be the transaction's own, not the shadowed messages:
+    // citing `startSeq` here would leave the summary pointing at history.
+    expect(checkpoint.sourceEventSeqs).toEqual([Number(start!.seq), Number(summary!.seq), ...shadowed.map(event => Number(event.seq))])
 
     // Framing must match what `dsh-compaction-basic` writes.
     const content = checkpoint.data?.content ?? []
@@ -428,5 +469,161 @@ describe('WorkBuddy summary checkpoint', () => {
     const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'auto' })
     expect(converted.summaryFold).toBeUndefined()
     expect(converted.loss.map(item => item.code)).toContain('summary-missing')
+  })
+
+  /**
+   * The runtime charges `compaction/summary.shadowedTokenCount` against
+   * `contextPressure.surfaceTokens`. v12 priced the shadowed range with chars/3
+   * over whole event JSON (~1.8x too high), which showed up as "已压缩 1000多万
+   * token" in the UI and drove the projection counter negative — a zod schema
+   * violation that makes the next cold restore throw. The declared price must
+   * be exactly the runtime's own heuristic price of that same range.
+   */
+  it('prices the shadowed range in runtime heuristic tokens so surfaceTokens stays non-negative', async () => {
+    const { root, path } = await bigTranscript()
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'always' })
+    const events = converted.events as Array<{
+      type?: string
+      seq?: number
+      surfaceOp?: unknown
+      data?: { shadowedRange?: { start?: number; end?: number }; shadowedTokenCount?: number; source?: { kind?: string }; content?: Array<{ text?: string }> }
+    }>
+    const summary = events.find(event => event.type === 'compaction/summary')!
+    const op = events.find(event => event.data?.source?.kind === 'compact-checkpoint')!.surfaceOp as { startSeq: number; endSeq: number }
+    const shadowed = events.filter(event => event.surfaceOp === 'append'
+      && Number(event.seq) >= op.startSeq && Number(event.seq) <= op.endSeq)
+    const recomputed = shadowed.reduce((sum, event) => sum + estimateEventTokens(event as never), 0)
+
+    expect(summary.data!.shadowedTokenCount).toBe(recomputed)
+    expect(converted.summaryFold!.shadowedTokens).toBe(recomputed)
+    // The full pre-fold surface minus the declared shadow price plus the
+    // checkpoint's own price must be >= 0 (the runtime's fold invariant).
+    const wholeSurface = events.filter(event => event.surfaceOp === 'append')
+      .reduce((sum, event) => sum + estimateEventTokens(event as never), 0)
+    const checkpointPrice = estimateEventTokens(events.find(event => event.data?.source?.kind === 'compact-checkpoint') as never)
+    expect(wholeSurface - summary.data!.shadowedTokenCount! + checkpointPrice).toBeGreaterThanOrEqual(0)
+    // A non-trivial surface must be priced with the estimator, not a flat 0.
+    expect(recomputed).toBeGreaterThan(0)
+  })
+
+  /** WorkBuddy's `<cb_summary>` verbatim replay has no curated `<summary>`. */
+  const SHELL_TEMPLATE = '<cb_summary>\nSummary of the conversation so far:\n'
+    + 'The conversation is between an AI agent and a user.\n'
+    + 'Use this to get up to speed, and continue helping the user as the AI agent.\n'
+    + 'Some contents may be omitted, indicated by "<omitted />".\n\n'
+    + '<previous_user_message><user_query>hello</user_query></previous_user_message>\n'
+    + '<previous_tool_call>Tool: Bash\nArguments: {"command":"ls"}</previous_tool_call>\n'
+    + '</cb_summary>'
+
+  /**
+   * v12 treated the template header plus the blank lines left by stripping
+   * `<previous_*>` blocks as a summary because it exceeded 80 characters. Those
+   * rows became checkpoint "阶段 N" sections whose `<cb_summary>` was empty.
+   * Only curated `<conversation_history_summary>` rows may become stages.
+   */
+  it('ignores empty cb_summary template pages and task notifications', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-shell-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    const notification = '<task-notification><task-id>x</task-id><status>completed</status>'
+      + '<summary>Background command "python build.py" completed with exit code 0</summary>'
+      + '</task-notification>\n\n[SYSTEM NOTIFICATION - NOT USER INPUT]'
+    const curated = '<conversation_history_summary>\n'
+      + 'Summary of the conversation between an AI agent and a user.\n'
+      + '<analysis>scratch analysis</analysis>\n'
+      + '<summary>' + SUMMARY + '</summary>\n</conversation_history_summary>'
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'start', timestamp: 1000 }),
+      JSON.stringify({ type: 'message', role: 'user', content: SHELL_TEMPLATE, timestamp: 2000 }),
+      JSON.stringify({ type: 'message', role: 'user', content: notification, timestamp: 3000 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'progress', timestamp: 4000 }),
+      // Two identical template pages to prove none of them become stages.
+      JSON.stringify({ type: 'message', role: 'user', content: SHELL_TEMPLATE, timestamp: 5000 }),
+      JSON.stringify({ type: 'message', role: 'user', content: curated, timestamp: 6000 }),
+      JSON.stringify({ type: 'message', role: 'user', content: 'recent question', timestamp: 7000 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'recent answer', timestamp: 7500 }),
+    ].join('\n'))
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'always' })
+    const checkpoint = (converted.events as Array<{ data?: { source?: { kind?: string }; content?: Array<{ text?: string }> } }>)
+      .find(event => event.data?.source?.kind === 'compact-checkpoint')
+    expect(checkpoint).toBeDefined()
+    const body = (checkpoint?.data?.content ?? []).map(block => block.text ?? '').join('')
+    // One curated summary => no "stages" wrapper and no template/notification text.
+    expect(body).toContain('Earlier work established the parser')
+    expect(body).not.toContain('阶段')
+    expect(body).not.toContain('Summary of the conversation so far')
+    expect(body).not.toContain('Background command')
+    expect(body).toContain('<compacted-summary>')
+  })
+
+  /** A `<cb_summary>`-only transcript has no usable summary at all. */
+  it('reports summary-missing when WorkBuddy only wrote template replay rows', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mwb-shellonly-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'start', timestamp: 1000 }),
+      JSON.stringify({ type: 'message', role: 'user', content: SHELL_TEMPLATE, timestamp: 2000 }),
+      ...Array.from({ length: 40 }, (_, index) => JSON.stringify({ type: 'message', role: 'assistant', content: `part ${String(index)} ${'z'.repeat(20_000)}`, timestamp: 3000 + index })),
+    ].join('\n'))
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'always' })
+    expect(converted.summaryFold).toBeUndefined()
+    expect(converted.loss.map(item => item.code)).toContain('summary-missing')
+    expect((converted.events as Array<{ data?: { source?: { kind?: string } } }>)
+      .some(event => event.data?.source?.kind === 'compact-checkpoint')).toBe(false)
+  })
+
+  /**
+   * A transcript whose only memory rows are `<cb_summary>` replays has no
+   * curated summary, yet its surface can exceed the model window — and the
+   * runtime compactor cannot summarize a prompt the model cannot receive.
+   * Folding the replay-derived request timeline keeps it continuable.
+   */
+  it('folds a replay-derived request timeline when no curated summary exists', async () => {
+    const queries = [
+      '帮我把这个仓库的构建脚本改成可以直接发布 Release 的形式，并补上作者信息与许可证',
+      '安装包传到手机后提示解析失败，请检查签名配置和 minSdkVersion 是否匹配',
+      '给设置页加一个数值右对齐的文本框，金额最多两位小数，服务端不接受小数时回退为正整数',
+      '把安卓端与网页端源码拆成两个仓库，并分别配置 GitHub Actions 自动构建',
+    ]
+    const replayBlock = queries.map((query, index) => '<previous_user_message>\n<user_query>'
+      + query
+      + '</user_query>\n</previous_user_message>\n<previous_assistant_message>\n'
+      + `第 ${String(index + 1)} 项已实现：修改了 build.gradle 与 workflow，并在本地构建通过。`
+      + '\n</previous_assistant_message>').join('\n')
+    const replayRow = JSON.stringify({
+      type: 'message',
+      role: 'user',
+      timestamp: 9000,
+      content: '<cb_summary>\nSummary of the conversation so far:\n'
+        + 'The conversation is between an AI agent and a user.\n'
+        + 'Use this to get up to speed, and continue helping the user as the AI agent.\n'
+        + 'Some contents may be omitted, indicated by "<omitted />".\n\n'
+        + replayBlock + '\n</cb_summary>',
+    })
+    const root = await mkdtemp(join(tmpdir(), 'mwb-digest-'))
+    await mkdir(join(root, 'projects', 'p'), { recursive: true })
+    const path = join(root, 'projects', 'p', 's.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'message', role: 'user', content: 'start the project', timestamp: 1000 }),
+      ...Array.from({ length: 60 }, (_, index) => JSON.stringify({ type: 'message', role: 'assistant', content: `step ${String(index)} ${'w'.repeat(30_000)}`, timestamp: 2000 + index })),
+      replayRow,
+      JSON.stringify({ type: 'message', role: 'user', content: 'recent question', timestamp: 10_000 }),
+      JSON.stringify({ type: 'message', role: 'assistant', content: 'recent answer', timestamp: 10_500 }),
+    ].join('\n'))
+
+    const converted = await convertWorkBuddySession(path, root, undefined, { summaryMode: 'auto' })
+    expect(converted.summaryFold).toBeDefined()
+    expect(converted.loss.map(item => item.code)).toContain('summary-digest')
+    const checkpoint = (converted.events as Array<{ data?: { source?: { kind?: string }; content?: Array<{ text?: string }> } }>)
+      .find(event => event.data?.source?.kind === 'compact-checkpoint')
+    expect(checkpoint).toBeDefined()
+    const body = (checkpoint?.data?.content ?? []).map(block => block.text ?? '').join('')
+    // The digest carries the real requests and never the WorkBuddy template.
+    expect(body).toContain('帮我把这个仓库的构建脚本改成可以直接发布 Release 的形式')
+    expect(body).toContain('把安卓端与网页端源码拆成两个仓库')
+    expect(body).not.toContain('Summary of the conversation so far')
+    expect(body).not.toContain('<cb_summary>')
+    expect(body).toContain('<compacted-summary>')
   })
 })

@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -46,7 +46,10 @@ describe('MigrationService incremental imports', () => {
       expect(changedPreview.summary.changed).toBe(1)
       const changed = await service.migrate({ sessions: true, memories: false, mcp: false })
       expect(changed.importedSessions).toBe(1)
+      // A change rewrites the SAME session. Minting a derived id here is what
+      // produced a duplicate conversation in the sidebar on every repair.
       expect(created).toHaveLength(2)
+      expect(created[1]).toBe(created[0])
 
       // The superseded import stays in the manifest as history, but it must never
       // be marked archived: archiving the old entry is what previously removed
@@ -56,7 +59,79 @@ describe('MigrationService incremental imports', () => {
       expect(manifest.sessions.filter(item => item.status === 'archived')).toHaveLength(0)
       expect(manifest.sessions[0]?.status).toBe('imported')
       expect(manifest.sessions[1]?.status).toBe('imported')
-      expect(manifest.sessions[0]?.targetSessionId).not.toBe(manifest.sessions[1]?.targetSessionId)
+      expect(manifest.sessions[0]?.targetSessionId).toBe(manifest.sessions[1]?.targetSessionId)
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
+
+  it('archives every stored copy of a source so one chat never splits into two', async () => {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-migration-source-'))
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-migration-target-'))
+    const project = join(sourceRoot, 'projects', 'project')
+    await mkdir(project, { recursive: true })
+    const sourcePath = join(project, 'session.jsonl')
+    await writeFile(sourcePath, JSON.stringify({ type: 'message', role: 'user', content: 'first', cwd: sourceRoot, timestamp: 1000 }))
+    const created: string[] = []
+    const persistence = {
+      // The real persistence publishes a log file inside the session group
+      // directory, so the fake does the same: the test asserts on the live tree.
+      create: async (header: { id: string }) => {
+        created.push(header.id)
+        const dir = join(targetRoot, 'sessions', '--group--', header.id)
+        await mkdir(dir, { recursive: true })
+        await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'new bytes')
+      },
+      append: async () => undefined,
+    }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      await service.migrate({ sessions: true, memories: false, mcp: false })
+      const firstId = created[0]
+      expect(firstId).toBeDefined()
+      if (firstId === undefined) throw new Error('no session was created')
+
+      // Reproduce the real leftover: an earlier import of the SAME WorkBuddy
+      // session, when its transcript was shorter, produced a different id
+      // (the id is derived from the source hash). That copy stayed in the live
+      // tree, so one chat showed up twice in the sidebar.
+      const legacyId = 'workbuddy-legacy-hash-id'
+      const group = join(targetRoot, 'sessions', '--group--')
+      for (const id of [firstId, legacyId]) {
+        const dir = join(group, id)
+        await mkdir(dir, { recursive: true })
+        await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'old bytes')
+      }
+      const manifestPath = service.manifestPath
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { sessions: Array<Record<string, unknown>> }
+      const firstRow = manifest.sessions[0] as Record<string, unknown>
+      // The manifest is append-only, so an EARLIER import sits at the front.
+      manifest.sessions.unshift({ ...firstRow, sourceHash: 'older-hash', targetSessionId: legacyId, converterVersion: 10 })
+      await writeFile(manifestPath, JSON.stringify(manifest, null, 2))
+
+      // The transcript grows, so the source hash changes and the repair runs.
+      await writeFile(sourcePath, JSON.stringify({ type: 'message', role: 'user', content: 'grown', cwd: sourceRoot, timestamp: 2000 }))
+      // A fresh service instance reloads the manifest from disk, exactly as a
+      // new plugin load does between two imports.
+      const second = new MigrationService(persistence as never, undefined, { sourceRoot })
+      const result = await second.migrate({ sessions: true, memories: false, mcp: false })
+      expect(result.importedSessions).toBe(1)
+
+      // Exactly one stored copy of the conversation must remain in the live tree.
+      const remaining = (await readdir(join(targetRoot, 'sessions', '--group--'))).filter(name => name.startsWith('workbuddy-'))
+      expect(remaining).toHaveLength(1)
+      expect(remaining[0]).toBe(created[created.length - 1])
+
+      // The displaced copies are moved aside, never deleted.
+      const backups = join(targetRoot, 'repair-backups')
+      const archived: string[] = []
+      for (const stamp of await readdir(backups)) {
+        archived.push(...await readdir(join(backups, stamp, '--group--')))
+      }
+      expect(archived.sort()).toEqual([legacyId, firstId].sort())
     } finally {
       if (previous === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previous
@@ -375,10 +450,16 @@ describe('MigrationService summary fold', () => {
   it('folds by default and records why, so a huge project stays continuable', async () => {
     const sourceRoot = await writeFoldableSource()
     const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-fold-target-'))
-    const written: Array<{ events: Array<{ data?: { source?: { kind?: string } } }> }> = []
+    const written: Array<{ type?: string; data?: { source?: { kind?: string } } }[]> = []
     const persistence = {
-      create: async () => ({ append: async (body: { events: never[] }) => { written.push(body as never) }, flush: async () => undefined, close: async () => undefined }),
-      append: async () => undefined,
+      create: async () => ({
+        // `writeSeededSession` hands the whole prefix to one append call, so the
+        // sealed log is exactly what lands here. There is deliberately NO
+        // top-level `append`: that older API short-circuits the v4 handle path.
+        append: async (batch: never[]) => { written.push(batch as never[]) },
+        flush: async () => undefined,
+        close: async () => undefined,
+      }),
     }
     const previous = process.env.DSH_HOME
     process.env.DSH_HOME = targetRoot
@@ -389,6 +470,34 @@ describe('MigrationService summary fold', () => {
       const result = await service.migrate({ sessions: true, memories: false, mcp: false })
       expect(result.importedSessions).toBe(1)
       expect(result.loss.map(item => item.code)).toContain('summary-checkpoint')
+      // The sealed log must carry the whole compaction transaction, not a lone
+      // checkpoint: the reader rejects that shape with "compaction checkpoint has
+      // no matching compaction/start", which is exactly the load failure this
+      // guards against. The inherited seed marker has to come last because it
+      // clears the open compaction.
+      const sealed = written.at(-1) ?? []
+      const types = sealed.map(event => event.type)
+      expect(types.filter(type => type?.startsWith('compaction/') === true)).toEqual([
+        'compaction/start',
+        'compaction/summary',
+        'compaction/end',
+      ])
+      // The transaction must be the tail of the log. The installed
+      // `dsh-session` dev dependency still reports SESSION_FORMAT_VERSION 0, so
+      // `writeSeededSession` adds the v4 `session/end-seed` marker only against
+      // the real runtime; when it is present it must follow `compaction/end`,
+      // because that marker clears the open compaction.
+      const seedIndex = types.indexOf('session/end-seed')
+      const endIndex = types.indexOf('compaction/end')
+      expect(endIndex).toBeGreaterThan(types.indexOf('compaction/summary'))
+      if (seedIndex === -1) expect(endIndex).toBe(sealed.length - 1)
+      else expect(seedIndex).toBe(sealed.length - 1)
+      // The checkpoint must cite the transaction frames it depends on.
+      const checkpoint = sealed.find(event => event.type === 'user/message' && (event as { data?: { source?: { kind?: string } } }).data?.source?.kind === 'compact-checkpoint') as { sourceEventSeqs?: number[]; seq?: number } | undefined
+      expect(checkpoint).toBeDefined()
+      const start = sealed.find(event => event.type === 'compaction/start') as { seq?: number }
+      const summary = sealed.find(event => event.type === 'compaction/summary') as { seq?: number }
+      expect(checkpoint!.sourceEventSeqs!.slice(0, 2)).toEqual([start.seq, summary.seq])
     } finally {
       if (previous === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previous

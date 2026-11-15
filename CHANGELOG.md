@@ -1,5 +1,174 @@
 # 更新日志
 
+## v0.2.10 — 2026-11-15
+
+**补上 v0.2.9 的一个副作用**：过滤掉空壳摘要后，少数会话失去了检查点，而它们的表面又超出模型窗口，发消息时会失败。
+
+### 为什么必须再补一次
+
+DSH 的自动压缩**不能分块**：`dsh-compaction-basic` 会把整个被遮蔽范围一次性发给
+摘要模型（`compactPressure` → `compactRegion` → `summarizeWithLlm`，无分块、无截断）。
+所以「表面大于上下文窗口」的会话根本无法被运行时压缩——这正是导入时就要写检查点
+的理由。v0.2.9 把空壳摘要过滤掉后：
+
+- `mwh2pp2a`（约 86.5 万 token）、`mwh2pp62`（约 46 万 token）失去了原来的检查点
+  （它俩此前的「摘要」只有一句 `Background command … completed`），完整导入后超过
+  300k 窗口，发消息会失败；
+- `mwh2pr2y`（约 26.5 万 token）勉强还在窗口内，但已越过 23.4 万的压缩阈值。
+
+### 回显摘要兜底
+
+WorkBuddy 的 `<cb_summary>` 回显行虽然没有整理过的 `<summary>`，却以标签形式带着
+**用户请求原文**与**助手当时自述的进展**：
+
+```
+<previous_user_message><user_query>…</user_query></previous_user_message>
+<previous_assistant_message>…</previous_assistant_message>
+```
+
+现在当「没有整理过的摘要」且「表面超过阈值」时，会从这些回显行里按时间顺序还原出
+一份请求时间线（用户请求最多 1500 字符、助手进展最多 400 字符，按首段去重、剔除后台
+任务通知），作为检查点正文折叠掉旧历史。它是确定性的，不额外调用模型。
+
+- 正文明确声明自己是「从历史回显还原」而不是 WorkBuddy 的摘要，不冒充整理结果；
+- 结果里记录 `summary-digest`，说明折叠了多少条、保留多少条；
+- 实测三份回显摘要的体积：用户请求约 0.7–1.1k token，助手进展约 4–14k token，
+  远小于尾部预算，折叠后模型实收 4 万 token 上下；
+- 只有「回显也太薄（< 400 字符实质内容）」时才退回按完整记录导入并记 `summary-missing`。
+
+新增回归测试：一个 180 万字符、只有回显行的会话会被折叠成检查点，正文含真实请求、
+不含 WorkBuddy 模板文字。
+
+
+## v0.2.9 — 2026-11-15
+
+**修复 v0.2.8 遗留的两个问题**：「已压缩」后面显示的 token 数虚高约 1.8 倍（并会让 DSH 的上下文压力计数变成负数），以及某些对话的检查点里「阶段 N」内容为空。
+
+### 1. 「已压缩 … 1000多万 token」——这个数不是模型实际收到的量
+
+界面里 `已压缩 N 条历史记录（约 M tokens）` 的 M 来自检查点写入的
+`compaction/summary.shadowedTokenCount`，它表示**被折叠掉的那部分历史有多大**，
+不是接下来要发给模型的量。以 `workbuddy-3c95e1b40d4011651e361f7b-mwh2pqjt` 为例：
+
+- 声明值 `11,465,753`；
+- 折叠后模型实际收到 **60 条消息 / 约 39,522 token**。
+
+问题在于 v0.2.8 用「整条事件 JSON 的字符数 ÷ 3」估这个价，而 DSH 运行时用的是
+另一套固定密度估算（字符 ÷ 4，再加每块 4、每条消息 4 的结构开销，tool-call 按
+名字与参数分别计价）。同一段范围两种算法的比值约 **1.81 倍**，于是 632 万被写成
+1146 万。
+
+更严重的副作用：DSH 的 `contextPressure` 投影会拿**声明的** `shadowedTokenCount`
+去抵减它自己重新测得的表面总量，
+`surfaceTokens = 全量(6,350,754) − 声明(11,465,753) + 检查点(15,533) = −5,099,466`。
+这个负值违反了运行时自己的 zod schema（要求非负），一旦缓存行变得可用，
+`SessionProjectionRegistry.restore()` 就会抛 ZodError。实测有 7 个会话是负值；
+之所以还没报错，只是因为它们的缓存行序号还大于日志末尾，暂时被判为不可用。
+
+现在把运行时的估算器**按原样复刻**到 `src/tokens.ts`（不能直接依赖
+`@deepseek-ai/dsh-token-meter`——安装后的插件目录里没有这个包），用同一套算法
+计算 `shadowedTokenCount`、尾部预算和 `auto` 阈值。声明价与运行时自测价一致，
+`surfaceTokens` 恒为非负。
+
+### 2. 检查点里「阶段 N」的内容是空的
+
+WorkBuddy 会写两种「记忆行」：
+
+- `<conversation_history_summary>`：内含 `<analysis>` 与整理过的 `<summary>`，几 KB，是真正可用的状态；
+- `<cb_summary>`：只有模板开场白，后面是大量 `<previous_user_message>` /
+  `<previous_tool_call>` 的**原文回显**，没有 `<summary>`。
+
+旧提取器对没有 `<summary>` 的行走兜底分支：剥掉 `<previous_*>` 块后，剩下的模板
+开场白与几十行空行仍超过 80 字符门槛，于是被当成摘要。多个这样的行合并后就变成
+`阶段 1 / 阶段 2 …`，每段只有模板文字、没有内容。`<task-notification>` 里那句
+`Background command "…" completed with exit code 0` 也被误抓成摘要。
+
+现在只认**有 `<conversation_history_summary>` 头、有 `<summary>` 块、且去掉模板
+后仍有 ≥80 字符实质内容**的行。真机上 18 个会话的比对：55 行 → 35 行，35 条真摘要
+全部保留，丢掉的 20 行全是纯模板空壳（12 行）与任务完成通知（8 行），无误纳。
+只有一个会话若完全没有真摘要，就不再硬造检查点，而是按完整记录导入并在结果里
+注明「没有可用的压缩摘要」。
+
+### 3. 其它
+
+- `SURFACE_EVENT_TYPES` 补上 `developer/message`，与运行时的表面事件集合一致
+  （否则覆盖该类型的 replace 会漏引用一个表面节点）。
+- `MIGRATION_CONVERTER_VERSION` 升到 13，下次导入会自动重建受影响的会话。
+
+## v0.2.8 — 2026-11-15
+
+**修复两个 v0.2.7 引入的问题**：折叠过的对话导入后打不开，以及重复导入会产生重复对话。
+
+### 1. 「历史加载失败：compaction checkpoint has no matching compaction/start」
+
+v0.2.7 只写了检查点这一条消息，没有写它与压缩事务的配对。DSH 读取时会用
+`source.compactionId` 去匹配一个正在打开的压缩，找不到就判定日志损坏并拒绝加载：
+
+```
+stored log is corrupt: SessionFormatError: compaction checkpoint has no matching compaction/start
+```
+
+现在导入会完整复现 DSH 自己压缩时提交的**四帧事务**，顺序与
+`dsh-compaction-basic` 的 `compactSurfaceRegion` 一致：
+
+1. `compaction/start`（`turn: null`，即手动/轮次外压缩）
+2. `compaction/summary`（带 `shadowedRange` / `shadowedSeqs` / `shadowedTokenCount`）
+3. `user/message` 检查点（`surfaceOp.replace` + `sourceEventSeqs`）
+4. `compaction/end`
+
+并且整段事务必须排在 `session/end-seed` **之前**——那个标记会清空「当前打开的压缩」，
+放在它后面事务就永远关不上。
+
+检查点引用的事务帧序号也一并修正：之前引用的是被遮蔽历史的起点，导致摘要没有可解析的来源。
+
+用 DSH 运行时的 `assertReleasedV4Relationships` 做了双向验证：四帧事务通过；
+只写检查点的旧形态被拒绝，报的正是用户看到的那句错误。
+
+### 2. 重复导入产生重复对话
+
+`service.ts` 在「修复 / 内容变化」时会派生一个新 id
+（`workbuddy-xxx-<时间戳>`），旧会话原样留着，于是侧边栏里同一个对话变成两份。
+
+现在**原地重写同一个会话 id**：把旧会话目录移动到
+`$DSH_HOME/repair-backups/reimport-<时间戳>/<分组>/<会话id>/`（移动，不是删除，
+旧记录随时可恢复），再用同一个 id 重新写入。一个来源始终只有一个对话。
+
+- 移动前的路径会记录在导入结果的 `session-replaced` 条目里；
+- `findLog` 会扫描所有分组目录，所以移动（而非只在新分组写）是必须的；
+- 新增回归测试：改变来源内容后 `created[1] === created[0]`。
+
+### 3. 已有的坏记录会自动重建
+
+`MIGRATION_CONVERTER_VERSION` 升到 **12**。已用 v11 导入的会话会被判定为「需要修复」，
+下次导入时自动按新格式原地重写（同一个会话 id，旧记录备份到 `repair-backups/`）。
+不需要你手动删除任何对话。
+
+### 4. 同一个来源不再残留第二份旧记录
+
+只修复「清单里记着的那一个 id」还不够。会话 id 是**由来源内容哈希派生**的，
+所以同一个 WorkBuddy 会话在内容变长之后会得到**新的 id**，而旧 id 那份仍然留在磁盘上；
+更早的版本每次修复还会再派生一个带时间戳的 id。结果是同一个对话在侧边栏里出现两三份。
+
+现在修复时会把这个来源**用过的所有 id** 一起移走（`archiveSourceCopies`）：
+当前 id、这次转换算出的新 id、以及清单里所有指向同一来源的历史 id。
+它们都被**移动**（不是删除）到 `$DSH_HOME/repair-backups/reimport-<时间戳>/<分组>/<会话id>/`，
+每个来源在侧边栏里只剩一个对话，旧字节随时可以移回来。
+
+新增回归测试 `archives every stored copy of a source so one chat never splits into two`：
+在磁盘上造出「同一个来源的两份记录」，重新导入后断言活目录里只剩一份，
+且两份旧记录都出现在 `repair-backups/` 里。
+
+### 5. 测试
+
+`tests/converter.spec.ts` 与 `tests/service.spec.ts` 改为断言四帧事务、
+事务帧引用、`turn: null`、以及「事务在 `session/end-seed` 之前」；
+全套 112 个测试通过。
+
+用 DSH 运行时的 `assertReleasedV4Relationships` 复核了磁盘上的真实数据：
+18 个会话**全部通过**，并且作为反向对照，同一批备份里的 8 份 v11 日志**全部被拒**
+（`replacement sourceEventSeqs omit a shadowed surface node`）——
+说明校验器确实在跑这条规则，而不是放行一切。
+
 ## v0.2.7 — 2026-11-15
 
 **导入后可以直接继续对话**：把 WorkBuddy 自己生成的压缩摘要折叠成 DSH 的检查点（checkpoint），

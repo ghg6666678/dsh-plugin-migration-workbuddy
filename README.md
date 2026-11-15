@@ -32,6 +32,13 @@ WorkBuddy 进程探测与导出面板，路由从 12 条收敛到 8 条，设置
 导入侧的修复全部保留：根目录 `MEMORY.md` 识别、脚手架记录清理、`settings` 路由注册、
 上下文预算、记忆摘要来源类型、元数据漂移判定等。
 
+**v0.2.10** 修掉两个影响大项目继续使用的缺陷：检查点声明的 `shadowedTokenCount` 改用
+运行时自己的估算器计价（原先用「整条 JSON 字符 ÷ 3」，虚高约 1.8 倍，把「已压缩」显示成
+一千多万 token，还会让 DSH 的上下文压力计数变成负数），以及只把 WorkBuddy **整理过的**
+压缩摘要折进检查点（`<cb_summary>` 模板回显会造成「阶段 N 内容为空」）。没有任何整理
+摘要又超出窗口的会话，会从回显里确定性还原一份请求时间线，保证仍可继续；修复导入改为
+原地重写，同一来源不再裂成两份对话。
+
 ## 安装
 
 本包自带 `cordis.patch.yml`，并通过 `dsh.bundle.patch` 声明自己是 profile bundle：`dsh plugin add`
@@ -41,7 +48,7 @@ WorkBuddy 进程探测与导出面板，路由从 12 条收敛到 8 条，设置
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.2.5/dsh-plugin-migration-workbuddy-0.2.5.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.2.10/dsh-plugin-migration-workbuddy-0.2.10.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -50,7 +57,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.2.5
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.2.10
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从

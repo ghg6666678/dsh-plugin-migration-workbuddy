@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { SESSION_FORMAT_VERSION, SessionId, SessionLogOffset, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
@@ -122,6 +122,65 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 }
 
 function targetRoot(): string { return process.env.DSH_HOME ?? join(homedir(), '.dsh') }
+
+/**
+ * Move a stored session directory out of the live tree before rewriting the
+ * same id.
+ *
+ * A published log is immutable — `sessionPersistence.create()` refuses an id
+ * that already exists — so repairing a session in place means removing the old
+ * copy first. The directory is moved (never deleted) under
+ * `$DSH_HOME/repair-backups`, so the previous conversation stays recoverable.
+ *
+ * @returns the backup path, or `undefined` when there was nothing to move.
+ */
+async function archiveStoredSession(root: string, sessionId: string): Promise<string | undefined> {
+  const sessionsRoot = join(root, 'sessions')
+  if (!existsSync(sessionsRoot)) return undefined
+  let groups: string[]
+  try {
+    groups = await readdir(sessionsRoot)
+  } catch {
+    return undefined
+  }
+  for (const group of groups) {
+    const source = join(sessionsRoot, group, sessionId)
+    if (!existsSync(source)) continue
+    const destination = join(root, 'repair-backups', `reimport-${new Date().toISOString().replace(/[:.]/g, '-')}`, group, sessionId)
+    await mkdir(join(destination, '..'), { recursive: true, mode: 0o700 })
+    try {
+      await rename(source, destination)
+    } catch {
+      // A cross-device or locked move must not abort the import.
+      return undefined
+    }
+    return destination
+  }
+  return undefined
+}
+
+/**
+ * Move every stored copy of one source's conversations out of the live tree.
+ *
+ * The target id is derived from the source hash, so a transcript that grew in
+ * WorkBuddy produces a NEW id and leaves the previous one behind. Older
+ * releases also minted a derived id (`<id>-<timestamp>`) on every repair,
+ * which split one chat into two in the sidebar. Both leftovers are copies of
+ * the same conversation, so they are archived together with the target: the
+ * user keeps exactly one conversation per WorkBuddy session, and nothing is
+ * deleted — every displaced copy stays recoverable under `repair-backups/`.
+ *
+ * @returns the backup paths, empty when there was nothing to move.
+ */
+async function archiveSourceCopies(root: string, sessionIds: readonly string[]): Promise<string[]> {
+  const moved: string[] = []
+  for (const id of new Set(sessionIds)) {
+    if (id === undefined) continue
+    const destination = await archiveStoredSession(root, id)
+    if (destination !== undefined) moved.push(destination)
+  }
+  return moved
+}
 
 /** Directory (under `$DSH_HOME/workspaces`) that owns imported conversations. */
 const WORKBUDDY_WORKSPACE_DIR = 'workbuddy-imported'
@@ -618,13 +677,30 @@ export class MigrationService {
           const needsRepair = known !== undefined && (known.converterVersion ?? 1) < MIGRATION_CONVERTER_VERSION
           const changed = known !== undefined && (known.sourceHash !== converted.sourceHash || (known.toolMode ?? 'transcript') !== this.toolMode() || (known.summaryMode ?? 'auto') !== summaryMode)
           if (known && selection.force !== true && !needsRepair && !changed) { result.skippedSessions += 1; batch.skippedSessions += 1; continue }
-          // Re-importing a changed session must never archive, hide, or delete the
-          // copy already in DSH. Archiving it removed the user's existing
-          // conversation from the sidebar, which read as "import silently
-          // archived my chats". A stored log is immutable (persistence publishes
-          // with a no-overwrite publish), so a changed source is written under a
-          // fresh, derived id while the previous copy stays exactly as it was.
-          const targetId = known === undefined ? converted.targetSessionId : `${converted.targetSessionId}-${Date.now().toString(36)}`
+          // A repair or content change rewrites the SAME session id. Minting a
+          // derived id (the previous behaviour) left the old copy in place and
+          // produced a second, duplicate conversation in the sidebar — the user
+          // saw one chat split into two every time a repair ran. A stored log is
+          // immutable (persistence publishes with a no-overwrite publish), so the
+          // previous directory is moved to `repair-backups/` first: that keeps one
+          // conversation per source and still leaves the old bytes recoverable.
+          // The move is only a rename, so a failed re-import can be restored by
+          // moving the directory back.
+          //
+          // Every id this source ever used is archived, not just the current one:
+          // the id is derived from the source hash, so a transcript that grew in
+          // WorkBuddy yields a new id, and older releases minted yet another
+          // derived id on every repair. Archiving all of them is what guarantees
+          // one conversation per WorkBuddy session in the sidebar.
+          const targetId = known === undefined ? converted.targetSessionId : known.targetSessionId
+          const displaced = await archiveSourceCopies(targetRoot(), [
+            targetId,
+            converted.targetSessionId,
+            ...manifest.sessions
+              .filter(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path || entry.sourceHash === converted.sourceHash))
+              .map(entry => entry.targetSessionId),
+          ])
+          for (const destination of displaced) result.loss.push({ code: 'session-replaced', detail: `同一会话在原地重写；旧记录已备份到 ${displayPath(destination)}` })
           // Session-mode sessions always belong to the shared session-mode
           // workspace. The transcript may carry its own absolute `cwd` (newer
           // WorkBuddy builds stamp it on every row); using that here would
