@@ -769,11 +769,33 @@ export class MigrationService {
           if (this.workspaceRegistry && workspacePath && existsSync(workspacePath)) {
             try {
               const title = metadata?.mode === 'session' ? WORKBUDDY_WORKSPACE_TITLE : basename(workspacePath)
-              const workspace = await this.workspaceRegistry.resolveByPath(workspacePath) ?? await this.workspaceRegistry.create(workspacePath, title)
-              // dsh >= 0.2 rebuilds workspace membership from stored session
-              // headers (cwd) at startup and has no attachSession method. Older
-              // builds need the explicit attach; call it only when present.
-              if (typeof workspace.attachSession === 'function') await workspace.attachSession(targetId)
+              let workspace = await this.workspaceRegistry.resolveByPath(workspacePath) ?? await this.workspaceRegistry.create(workspacePath, title)
+              // Membership is what puts the conversation in the sidebar: a
+              // session whose log exists but which is absent from
+              // `workspace.sessionIds` is not listed, and there is no rebuild
+              // that re-adds it. `attachSession` does exist in dsh 0.2 (the
+              // gateway uses it when creating a session), so look it up on the
+              // registry record when the resolved value is a plain data form.
+              if (typeof (workspace as { attachSession?: unknown }).attachSession !== 'function') {
+                const byId = (this.workspaceRegistry as unknown as { get?: (id: string) => unknown }).get?.(workspace.id)
+                if (byId !== undefined) workspace = byId as typeof workspace
+              }
+              const attach = (workspace as { attachSession?: (id: string) => Promise<unknown> }).attachSession
+              if (typeof attach === 'function') await attach.call(workspace, targetId)
+              // Verify instead of trusting the call: a silent no-op here is what
+              // left an imported conversation invisible while its log was fine.
+              const registry = this.workspaceRegistry as unknown as {
+                list?: () => Array<{ id: string; sessionIds: readonly string[] }>
+                get?: (id: string) => { id: string; sessionIds: readonly string[] } | undefined
+              }
+              const fresh = registry.get?.(workspace.id) ?? registry.list?.().find(entry => entry.id === workspace.id)
+              const listed = fresh?.sessionIds.includes(targetId) === true
+              if (!listed) {
+                result.loss.push({
+                  code: 'workspace-attach-failed',
+                  detail: `会话已写入但未加入工作区「${title}」的列表，侧边栏可能看不到它；可在 DSH 里重新打开该工作区或重新导入该会话（工作区路径 ${displayPath(workspacePath)}）`,
+                })
+              }
             } catch (cause) {
               // A missing/unavailable source workspace must not make an otherwise
               // valid session import fail. It remains visible under Ungrouped and
