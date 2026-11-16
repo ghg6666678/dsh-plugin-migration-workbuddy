@@ -137,6 +137,63 @@ describe('MigrationService incremental imports', () => {
       else process.env.DSH_HOME = previous
     }
   })
+
+  /**
+   * A repair moves the previous copies aside BEFORE writing, because the
+   * persistence layer refuses an id that already exists. If that write then
+   * fails — the real trigger was a session still loaded by the running
+   * Harness — the copies must be moved back, or the conversation the user was
+   * reading vanishes from the sidebar and only a backup directory remains.
+   */
+  it('restores the previous conversation when the rewrite fails', async () => {
+    const sourceRoot = await mkdtemp(join(tmpdir(), 'mwb-migration-source-'))
+    const targetRoot = await mkdtemp(join(tmpdir(), 'mwb-migration-target-'))
+    const project = join(sourceRoot, 'projects', 'project')
+    await mkdir(project, { recursive: true })
+    const sourcePath = join(project, 'session.jsonl')
+    await writeFile(sourcePath, JSON.stringify({ type: 'message', role: 'user', content: 'first', cwd: sourceRoot, timestamp: 1000 }))
+    let failNext = false
+    const created: string[] = []
+    const persistence = {
+      create: async (header: { id: string }) => {
+        if (failNext) throw new Error('session "x" already exists (pending)')
+        created.push(header.id)
+        const dir = join(targetRoot, 'sessions', '--group--', header.id)
+        await mkdir(dir, { recursive: true })
+        await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'bytes')
+      },
+      append: async () => undefined,
+    }
+    const previous = process.env.DSH_HOME
+    process.env.DSH_HOME = targetRoot
+    try {
+      const service = new MigrationService(persistence as never, undefined, { sourceRoot })
+      await service.migrate({ sessions: true, memories: false, mcp: false })
+      const id = created[0]
+      expect(id).toBeDefined()
+      if (id === undefined) throw new Error('no session was created')
+      const liveDir = join(targetRoot, 'sessions', '--group--', id)
+      expect((await readdir(liveDir)).length).toBeGreaterThan(0)
+
+      // The transcript grows, so the repair path runs — and the write fails.
+      await writeFile(sourcePath, JSON.stringify({ type: 'message', role: 'user', content: 'grown', cwd: sourceRoot, timestamp: 2000 }))
+      failNext = true
+      const second = new MigrationService(persistence as never, undefined, { sourceRoot })
+      const result = await second.migrate({ sessions: true, memories: false, mcp: false })
+      expect(result.importedSessions).toBe(0)
+      expect(result.errors).toHaveLength(1)
+      // The error must name the suspension reason, not just "already exists".
+      expect(result.errors[0]!.message).toMatch(/仍被 DSH 打开|already exists/)
+
+      // The conversation is back in the live tree with its original bytes.
+      const remaining = (await readdir(join(targetRoot, 'sessions', '--group--'))).filter(name => name.startsWith('workbuddy-'))
+      expect(remaining).toEqual([id])
+      expect(await readFile(join(liveDir, 'session.v4.jsonl.zstd'), 'utf8')).toBe('bytes')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+    }
+  })
 })
 
 describe('MigrationService on-demand session selection', () => {

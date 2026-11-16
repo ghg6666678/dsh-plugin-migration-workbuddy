@@ -124,17 +124,30 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 function targetRoot(): string { return process.env.DSH_HOME ?? join(homedir(), '.dsh') }
 
 /**
+ * One live session directory that was moved out of the way for a rewrite.
+ *
+ * Keeping both endpoints is what makes the rewrite reversible: if the follow-up
+ * write fails, the directory is renamed back and the conversation never
+ * disappears from the sidebar.
+ */
+interface ArchivedSession { readonly source: string; readonly destination: string }
+
+/**
  * Move a stored session directory out of the live tree before rewriting the
  * same id.
  *
  * A published log is immutable — `sessionPersistence.create()` refuses an id
  * that already exists — so repairing a session in place means removing the old
  * copy first. The directory is moved (never deleted) under
- * `$DSH_HOME/repair-backups`, so the previous conversation stays recoverable.
+ * `$DSH_HOME/repair-backups`, so the previous conversation stays recoverable and
+ * a failed write can be rolled back.
  *
- * @returns the backup path, or `undefined` when there was nothing to move.
+ * @returns the moved copy, or `undefined` when there was nothing to move.
+ * @throws when the directory exists but cannot be moved (locked by another
+ *   process). Writing would then collide with the old copy, so the caller must
+ *   abort — before anything is written — rather than lose the conversation.
  */
-async function archiveStoredSession(root: string, sessionId: string): Promise<string | undefined> {
+async function archiveStoredSession(root: string, sessionId: string): Promise<ArchivedSession | undefined> {
   const sessionsRoot = join(root, 'sessions')
   if (!existsSync(sessionsRoot)) return undefined
   let groups: string[]
@@ -150,11 +163,11 @@ async function archiveStoredSession(root: string, sessionId: string): Promise<st
     await mkdir(join(destination, '..'), { recursive: true, mode: 0o700 })
     try {
       await rename(source, destination)
-    } catch {
-      // A cross-device or locked move must not abort the import.
-      return undefined
+    } catch (cause) {
+      // The old bytes are untouched, so nothing is lost: report and stop.
+      throw new Error(`无法移动旧会话目录（可能仍被占用）：${source}；${cause instanceof Error ? cause.message : String(cause)}`)
     }
-    return destination
+    return { source, destination }
   }
   return undefined
 }
@@ -170,16 +183,38 @@ async function archiveStoredSession(root: string, sessionId: string): Promise<st
  * user keeps exactly one conversation per WorkBuddy session, and nothing is
  * deleted — every displaced copy stays recoverable under `repair-backups/`.
  *
- * @returns the backup paths, empty when there was nothing to move.
+ * @returns the moved copies, empty when there was nothing to move.
  */
-async function archiveSourceCopies(root: string, sessionIds: readonly string[]): Promise<string[]> {
-  const moved: string[] = []
+async function archiveSourceCopies(root: string, sessionIds: readonly string[]): Promise<ArchivedSession[]> {
+  const moved: ArchivedSession[] = []
   for (const id of new Set(sessionIds)) {
     if (id === undefined) continue
-    const destination = await archiveStoredSession(root, id)
-    if (destination !== undefined) moved.push(destination)
+    const archived = await archiveStoredSession(root, id)
+    if (archived !== undefined) moved.push(archived)
   }
   return moved
+}
+
+/**
+ * Put every archived copy back where it was.
+ *
+ * Used when the rewrite fails: the session keeps its id, so the previous
+ * conversation has to reappear rather than linger only in `repair-backups`.
+ * Best effort — a restore that fails leaves the backup in place, which is why
+ * the failure is reported alongside the original error.
+ *
+ * @returns the copies that could not be restored, with the reason.
+ */
+async function restoreArchivedSessions(archived: readonly ArchivedSession[]): Promise<string[]> {
+  const failed: string[] = []
+  for (const entry of archived) {
+    try {
+      await rename(entry.destination, entry.source)
+    } catch (cause) {
+      failed.push(`${entry.source}（备份仍在 ${entry.destination}；${cause instanceof Error ? cause.message : String(cause)}）`)
+    }
+  }
+  return failed
 }
 
 /** Directory (under `$DSH_HOME/workspaces`) that owns imported conversations. */
@@ -700,7 +735,7 @@ export class MigrationService {
               .filter(entry => entry.archived !== true && (entry.sourceKey === key || entry.sourceSessionId === item.sessionId || entry.sourcePath === item.path || entry.sourceHash === converted.sourceHash))
               .map(entry => entry.targetSessionId),
           ])
-          for (const destination of displaced) result.loss.push({ code: 'session-replaced', detail: `同一会话在原地重写；旧记录已备份到 ${displayPath(destination)}` })
+          for (const entry of displaced) result.loss.push({ code: 'session-replaced', detail: `同一会话在原地重写；旧记录已备份到 ${displayPath(entry.destination)}` })
           // Session-mode sessions always belong to the shared session-mode
           // workspace. The transcript may carry its own absolute `cwd` (newer
           // WorkBuddy builds stamp it on every row); using that here would
@@ -712,7 +747,21 @@ export class MigrationService {
           // runtime then treats [0, events.length) as seed and never replays the
           // imported log into the live surface, which would otherwise duplicate
           // the whole history in the first request (gateway: Duplicate tool output).
-          await writeSeededSession(this.persistence, header, converted.events as SessionEvent[], SessionId(targetId))
+          try {
+            await writeSeededSession(this.persistence, header, converted.events as SessionEvent[], SessionId(targetId))
+          } catch (cause) {
+            // The rewrite moved the previous copies out of the live tree, so a
+            // failed create must put them back: otherwise the conversation the
+            // user was reading silently disappears from the sidebar and only a
+            // backup directory remains. Reproduced on 2026-11-16 with a session
+            // still loaded by the running Harness.
+            const unrestored = await restoreArchivedSessions(displaced)
+            const detail = cause instanceof Error ? cause.message : String(cause)
+            const hint = /already exists|pending/i.test(detail)
+              ? '该会话可能仍被 DSH 打开着；请关掉它（或重启 Harness）后再重新导入。'
+              : ''
+            throw new Error(`${detail}${hint}${unrestored.length > 0 ? `旧记录有 ${String(unrestored.length)} 份未能自动还原：${unrestored.join('；')}` : '旧记录已自动还原。'}`)
+          }
           // WorkBuddy records carry the authoritative workspace in `cwd`. The
           // sanitized project directory is only a fallback: splitting its
           // hyphens cannot faithfully represent nested paths.
