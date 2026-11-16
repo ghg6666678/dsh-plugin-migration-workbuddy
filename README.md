@@ -63,6 +63,16 @@ WorkBuddy **整理过的**压缩摘要折进检查点，`<cb_summary>` 模板回
 移回原位**，移动失败则在写入前就中止，并在 `already exists` / `pending` 时提示先关掉该会话
 或重启 Harness。
 
+**v0.4.10** 修掉「会话文件在、但侧边栏列表里看不到」：原地重写会先把旧目录挪走，运行时随即
+把这个 id 从工作区成员表（`storages/workspace.json` 的 `sessionIds`）里剪掉，写回后没人加回去。
+插件里原先「dsh >= 0.2 已移除 `attachSession`」的假设也是错的。现在挂载后会**回读成员列表
+校验**，校验失败写 `workspace-attach-failed`，不再静默。
+
+**v0.4.11** 修掉「导出面板不能取消勾选」：会话行的 checkbox 原先 `onChange` 是空实现、点方框
+完全不改状态；预览刷新（手动 / 导出后自动）又把「一个都不选」误判成「还没决定」而全选回来。
+现在 checkbox 接到 toggle，并把选择协调抽成纯函数 —— 未编辑前用默认全选，编辑过的显式选择
+（含空选择）跨刷新保留。另修掉「新建空会话可勾选却无法导出」的不一致。
+
 ## 安装
 
 本包自带 `cordis.patch.yml`，并通过 `dsh.bundle.patch` 声明自己是 profile bundle：`dsh plugin add`
@@ -72,7 +82,7 @@ WorkBuddy **整理过的**压缩摘要折进检查点，`<cb_summary>` 模板回
 
 ```bash
 dsh plugin --profile <name> add \
-  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.9/dsh-plugin-migration-workbuddy-0.4.9.tgz
+  https://github.com/ghg6666678/dsh-plugin-migration-workbuddy/releases/download/v0.4.11/dsh-plugin-migration-workbuddy-0.4.11.tgz
 ```
 
 tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 3 秒、退出码 0**，不需要任何
@@ -81,7 +91,7 @@ tgz 里已经是构建好的 `lib/`，装完即用：实测**一条命令、约 
 ### 从 GitHub 按 tag 安装（需要构建授权）
 
 ```bash
-dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.9
+dsh plugin --profile <name> add github:ghg6666678/dsh-plugin-migration-workbuddy#v0.4.11
 ```
 
 git 安装取的是**源码而不是构建产物**，所以本包提供 `prepare` 脚本，由 pnpm 在安装后自动从

@@ -1,15 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ExportPreview, ExportResult, ExportSessionSummary } from '../model.js'
 import { blockedActivity, type MigrationApi } from './api.js'
+import { isExportWritable as isWritable, reconcileSelection, toggleId } from '../export-selection.js'
 import { ExportBoards } from './ExportBoards.js'
 
 export type ExportPanelProps = PropsLocale<'migration.workbuddy'> & { api: MigrationApi }
-
-/** Statuses that have something for the export direction to write. */
-function isWritable(item: ExportSessionSummary): boolean {
-  return item.status === 'new' || item.status === 'ahead' || item.status === 'conflict'
-}
 
 /** Rows a plan would write, for the "N rows" hint. */
 function rowCount(item: ExportSessionSummary): number {
@@ -33,6 +29,10 @@ export function ExportPanel({ t, api }: ExportPanelProps): React.ReactElement {
   const [memoryIds, setMemoryIds] = useState<string[]>([])
   const [mcpIds, setMcpIds] = useState<string[]>([])
   const [automationIds, setAutomationIds] = useState<string[]>([])
+  // Whether the user has edited a selection by hand. Until then a refresh may
+  // default the lists; afterwards the explicit choice — including "nothing
+  // checked" — survives, so unchecking is never silently undone.
+  const touched = useRef({ sessions: false, memories: false, mcp: false, automations: false })
 
   const refresh = (options: { refresh?: boolean } = {}): void => {
     setLoading(true); setError(undefined)
@@ -40,18 +40,27 @@ export function ExportPanel({ t, api }: ExportPanelProps): React.ReactElement {
       .then(value => {
         setPreview(value)
         setBlocked(value.activity.running || !value.activity.observed ? value.activity : undefined)
-        setSelected(current => {
-          const writable = value.sessions.filter(isWritable).map(item => item.id)
-          // Keep an explicit choice across refreshes, but never keep a session
-          // that no longer needs writing.
-          const kept = current.filter(id => writable.includes(id))
-          return kept.length > 0 ? kept : writable
-        })
-        // The boards start fully selected; a record that is already in
-        // WorkBuddy simply is not offered.
-        setMemoryIds(value.memories.records.filter(item => !item.present).map(item => item.id))
-        setMcpIds(value.mcp.servers.filter(item => item.status === 'new').map(item => item.id))
-        setAutomationIds(value.automations.automations.filter(item => item.status === 'new').map(item => item.id))
+        setSelected(current => reconcileSelection(
+          current,
+          value.sessions.filter(isWritable).map(item => item.id),
+          touched.current.sessions,
+        ))
+        // A record already present in WorkBuddy is not offered at all.
+        setMemoryIds(current => reconcileSelection(
+          current,
+          value.memories.records.filter(item => !item.present).map(item => item.id),
+          touched.current.memories,
+        ))
+        setMcpIds(current => reconcileSelection(
+          current,
+          value.mcp.servers.filter(item => item.status === 'new').map(item => item.id),
+          touched.current.mcp,
+        ))
+        setAutomationIds(current => reconcileSelection(
+          current,
+          value.automations.automations.filter(item => item.status === 'new').map(item => item.id),
+          touched.current.automations,
+        ))
       })
       .catch(cause => setError(cause instanceof Error ? cause.message : t('loadFailed')))
       .finally(() => setLoading(false))
@@ -75,8 +84,15 @@ export function ExportPanel({ t, api }: ExportPanelProps): React.ReactElement {
     setStep('quit')
   }
 
-  const toggle = (setter: (update: (current: string[]) => string[]) => void) => (id: string): void => {
-    setter(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id])
+  /** Toggle one session row; every manual edit marks the selection as explicit. */
+  const toggleSession = (id: string): void => {
+    touched.current.sessions = true
+    setSelected(current => toggleId(current, id))
+  }
+
+  const toggle = (board: keyof typeof touched.current, setter: (update: (current: string[]) => string[]) => void) => (id: string): void => {
+    touched.current[board] = true
+    setter(current => toggleId(current, id))
   }
 
   const run = async (): Promise<void> => {
@@ -163,15 +179,16 @@ export function ExportPanel({ t, api }: ExportPanelProps): React.ReactElement {
                 data-disabled={isWritable(item) ? undefined : 'true'}
                 key={item.id}
                 type="button"
-                onClick={() => { if (!isWritable(item)) return; setSelected(current => current.includes(item.id) ? current.filter(id => id !== item.id) : [...current, item.id]) }}
+                onClick={() => { if (isWritable(item)) toggleSession(item.id) }}
               >
                 <input
                   className="mwb-migration-check"
                   type="checkbox"
                   checked={selected.includes(item.id)}
                   disabled={!isWritable(item)}
-                  onChange={() => undefined}
+                  onChange={() => { if (isWritable(item)) toggleSession(item.id) }}
                   onClick={event => event.stopPropagation()}
+                  aria-label={item.title ?? item.id}
                 />
                 <span className="mwb-migration-row-main">
                   <span className="mwb-migration-row-title">{item.title ?? item.id}</span>
@@ -200,9 +217,9 @@ export function ExportPanel({ t, api }: ExportPanelProps): React.ReactElement {
             memoryIds={memoryIds}
             mcpIds={mcpIds}
             automationIds={automationIds}
-            onToggleMemory={toggle(setMemoryIds)}
-            onToggleMcp={toggle(setMcpIds)}
-            onToggleAutomation={toggle(setAutomationIds)}
+            onToggleMemory={toggle('memories', setMemoryIds)}
+            onToggleMcp={toggle('mcp', setMcpIds)}
+            onToggleAutomation={toggle('automations', setAutomationIds)}
             disabled={running}
           />
         </>}
@@ -213,7 +230,10 @@ export function ExportPanel({ t, api }: ExportPanelProps): React.ReactElement {
           type="checkbox"
           checked={allSelected}
           disabled={writable.length === 0}
-          onChange={() => setSelected(allSelected ? [] : writable.map(item => item.id))}
+          onChange={() => {
+            touched.current.sessions = true
+            setSelected(allSelected ? [] : writable.map(item => item.id))
+          }}
         /> {t('exportSelectAll')}
       </label>
       <div style={{ display: 'flex', gap: 10 }}>
